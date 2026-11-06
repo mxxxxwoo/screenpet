@@ -304,6 +304,7 @@ fn main() {
             gifts::gift_collect,
             gifts::book_state,
             objects::object_down,
+            objects::object_hover,
             objects::object_menu,
             objects::postit_max,
             objects::postit_submit,

@@ -1323,3 +1323,21 @@ fn a_new_umbrella_falls_and_rests_flipped_with_the_handle_up() {
     }
     assert!(o.angle().abs() < 60.0, "rests at {}", o.angle());
 }
+
+#[test]
+fn the_sender_tag_names_the_friend_by_how_the_thing_came() {
+    assert_eq!(sender_tag(Arrival::Thrown, "철수").as_deref(), Some("🎯 철수"));
+    assert_eq!(sender_tag(Arrival::Bounced, "철수").as_deref(), Some("↩ 철수"));
+    assert_eq!(sender_tag(Arrival::GuestPoop, " 영희 ").as_deref(), Some("🐾 영희"));
+}
+
+#[test]
+fn a_sender_tag_needs_a_name_and_stays_short() {
+    assert_eq!(sender_tag(Arrival::Thrown, ""), None);
+    assert_eq!(sender_tag(Arrival::Thrown, "   "), None);
+    let long = "가".repeat(SENDER_TAG_CHARS + 5);
+    let tag = sender_tag(Arrival::Thrown, &long).unwrap();
+    assert_eq!(tag, format!("🎯 {}…", "가".repeat(SENDER_TAG_CHARS)));
+    let exact = "나".repeat(SENDER_TAG_CHARS);
+    assert!(!sender_tag(Arrival::Thrown, &exact).unwrap().ends_with('…'));
+}

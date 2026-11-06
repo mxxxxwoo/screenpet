@@ -84,6 +84,7 @@ fn main() {
         "gift_collect",
         "book_state",
         "object_down",
+        "object_hover",
         "object_menu",
         "postit_max",
         "postit_submit",

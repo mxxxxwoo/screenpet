@@ -772,7 +772,11 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                     continue;
                 }
                 if let Some((x, y)) = s.pet.try_poop() {
-                    objects.drop_poop(screenpet_core::poop::kind_for(&s.entry.id), x, y, screenpet_core::poop::size_for(s.shown.scale));
+                    let guest_owner = match &s.role {
+                        crate::slots::Role::Guest(g) => Some(g.owner_name.as_str()),
+                        crate::slots::Role::Own => None,
+                    };
+                    objects.drop_poop(screenpet_core::poop::kind_for(&s.entry.id), x, y, screenpet_core::poop::size_for(s.shown.scale), guest_owner);
                 }
             }
         }

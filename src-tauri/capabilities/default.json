@@ -59,7 +59,7 @@
     {
       "identifier": "object-windows",
       "windows": ["object-*"],
-      "permissions": ["allow-object-down", "allow-object-menu"]
+      "permissions": ["allow-object-down", "allow-object-hover", "allow-object-menu"]
     },
     {
       "identifier": "postit-window",

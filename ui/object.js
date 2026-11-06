@@ -1,5 +1,6 @@
 // 물건 창: 그림 한 장 + 포스트잇. 물리는 앱(코어 object.rs)이 하고 여기는 받은 각도만 CSS로 돌린다.
 // 그림은 제 무게중심(코어 tumble.rs)을 축으로 돌고, 창은 그 축을 가운데에 둔 채 움직인다 — 그래서 어떤 각도에서도 잘리지 않는다.
+// 친구 화면에서 온 물건은 내려앉을 때·마우스를 올릴 때 보낸 이 꼬리표(`object-tag` "🎯 철수")가 잠깐 뜬다 — 창을 넓히고 숨기는 건 앱이다.
 // 포스트잇 글자는 받는 사람이 누른 순간에만 `object-note`로 온다 — 그 전엔 이 창에 없고, `object-note-end`면 지운다.
 const { invoke } = window.__TAURI__.core;
 const here = window.__TAURI__.webviewWindow.getCurrentWebviewWindow();
@@ -21,6 +22,7 @@ const thing = document.getElementById("thing");
 const art = document.getElementById("art");
 const sticker = document.getElementById("sticker");
 const note = document.getElementById("note");
+const tag = document.getElementById("tag");
 
 const spot = POSTIT_AT[info.kind] || POSTIT_AT.can;
 const SCALE = 96 / 128;
@@ -87,6 +89,7 @@ function layout() {
   thing.style.left = `calc(50% - ${pivotX}px)`;
   thing.style.bottom = `${side / 2 - (m.side - pivotY)}px`;
   note.style.bottom = `${side + 4}px`;
+  tag.style.bottom = `${side + 2}px`;
 }
 
 function applyPose(p) {
@@ -148,6 +151,7 @@ sticker.hidden = !info.sticker;
 thing.addEventListener("mousedown", (e) => {
   if (e.button === 0) invoke("object_down");
 });
+thing.addEventListener("mouseenter", () => invoke("object_hover"));
 thing.addEventListener("contextmenu", () => invoke("object_menu"));
 window.addEventListener("contextmenu", (e) => e.preventDefault());
 window.addEventListener("dragstart", (e) => e.preventDefault());
@@ -167,6 +171,14 @@ here.listen("object-sticker", ({ payload: on }) => {
 here.listen("object-note", ({ payload: text }) => {
   note.textContent = text;
   note.hidden = false;
+});
+here.listen("object-tag", ({ payload: text }) => {
+  tag.textContent = text;
+  tag.hidden = false;
+});
+here.listen("object-tag-end", () => {
+  tag.textContent = "";
+  tag.hidden = true;
 });
 here.listen("object-note-end", () => {
   note.textContent = "";

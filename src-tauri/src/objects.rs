@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use screenpet_core::config::Config;
 use screenpet_core::geom::{Rect, WindowInfo};
-use screenpet_core::object::{accept_toss, AcceptedToss, Exit, Object, ObjectKind, Origin, Postit, Release, Roster, TossBudget, TossInbox, MAX_OWN_OBJECTS, MAX_POOPS, OBJECT_LOGICAL_SIZE, Volley, volley_piece};
+use screenpet_core::object::{accept_toss, sender_tag, AcceptedToss, Arrival, Exit, Object, ObjectKind, Origin, Postit, Release, Roster, TossBudget, TossInbox, MAX_OWN_OBJECTS, MAX_POOPS, OBJECT_LOGICAL_SIZE, Volley, volley_piece};
 use screenpet_core::brain::Pet;
 use screenpet_core::broom::Broom;
 use screenpet_core::social::Social;
@@ -35,6 +35,13 @@ const POSTIT_FORM: crate::overlay::Form = crate::overlay::Form { label: POSTIT_L
 /// 포스트잇을 읽는 동안의 창: 너비, 위로 더하는 자리 (논리 px)
 const NOTE_WIDTH: f64 = 232.0;
 const NOTE_SPACE: f64 = 84.0;
+/// 보낸 이 꼬리표("🎯 철수")가 뜬 동안의 창: 너비, 위로 더하는 자리 (논리 px)
+const TAG_WIDTH: f64 = 168.0;
+const TAG_SPACE: f64 = 26.0;
+/// 친구가 보낸 물건이 내려앉으면 꼬리표를 이만큼 보인다
+const TAG_ARRIVE: Duration = Duration::from_secs(4);
+/// 마우스를 올리면 꼬리표를 이만큼 다시 보인다
+const TAG_HOVER: Duration = Duration::from_secs(3);
 /// 뿅 사라지는 동안 기다렸다 닫는다 (object.html poof 0.3초)
 const POOF: Duration = Duration::from_millis(400);
 /// 똥이 스르륵 사라지는 동안 기다렸다 닫는다 (object.html fade 1.5초)
@@ -76,6 +83,8 @@ pub enum ObjectInput {
     ClearAll,
     /// 창의 물건을 눌렀다
     Down { label: String },
+    /// 물건에 마우스를 올렸다 (보낸 이 꼬리표를 다시 보인다)
+    Hover { label: String },
     Remove { label: String },
     /// 우클릭 "포스트잇 붙이기…"
     EditPostit { label: String },
@@ -110,6 +119,12 @@ struct Live {
     last_pos: Option<(i32, i32)>,
     last_pose: PosePayload,
     note_open: bool,
+    /// 보낸 이 꼬리표 글자 ("🎯 철수" — 친구 화면에서 온 물건만, 내 친구 목록의 이름으로)
+    tag: Option<String>,
+    /// 아직 한 번도 내려앉지 않았다 (처음 내려앉으면 꼬리표를 보인다)
+    tag_on_land: bool,
+    /// 꼬리표가 떠 있으면 숨길 때
+    tag_until: Option<Instant>,
     /// Windows 창 핸들 (포커스를 뺏지 않고 옮기려고)
     hwnd: Option<isize>,
 }
@@ -117,12 +132,48 @@ struct Live {
 impl Live {
     /// 창은 도는 축을 가운데에 두는 정사각형 (어떤 각도로 돌아도 그림이 잘리지 않는다, 종류마다 크기가 다르다).
     /// 쪽지를 읽는 동안엔 넓어지고 위로 자리가 더 생긴다 — 축은 아래쪽 정사각형의 가운데 그대로
+    /// 꼬리표가 떠 있는 동안에도 위로 자리가 더 생긴다 (쪽지가 먼저)
     fn logical_size(&self) -> (f64, f64) {
         let side = shape_of(self.object.kind).window_side_at(self.object.scale());
         if self.note_open {
             (NOTE_WIDTH, side + NOTE_SPACE)
+        } else if self.tag_until.is_some() {
+            (TAG_WIDTH.max(side), side + TAG_SPACE)
         } else {
             (side, side)
+        }
+    }
+
+    /// 쪽지나 꼬리표 때문에 창이 넓어졌다
+    fn widened(&self) -> bool {
+        self.note_open || self.tag_until.is_some()
+    }
+
+    /// 창 크기를 logical_size에 맞추고 다음 place가 다시 옮기게 한다
+    fn resize(&mut self) {
+        let (w, h) = self.logical_size();
+        let dpi = self.object.dpi();
+        crate::overlay::resize_quietly(&self.window, self.hwnd, (w * dpi).round() as u32, (h * dpi).round() as u32);
+        self.last_pos = None;
+    }
+
+    /// 보낸 이 꼬리표를 until까지 보인다 (꼬리표가 없거나 쪽지를 읽는 중이면 그대로)
+    fn show_tag(&mut self, app: &AppHandle, until: Instant) {
+        let Some(text) = self.tag.clone() else { return };
+        if self.note_open {
+            return;
+        }
+        let was_open = self.tag_until.replace(until).is_some();
+        if !was_open {
+            self.resize();
+            let _ = app.emit_to(self.label.as_str(), "object-tag", text);
+        }
+    }
+
+    fn hide_tag(&mut self, app: &AppHandle) {
+        if self.tag_until.take().is_some() {
+            let _ = app.emit_to(self.label.as_str(), "object-tag-end", ());
+            self.resize();
         }
     }
 
@@ -132,8 +183,8 @@ impl Live {
         let (w, h) = self.logical_size();
         let (cx, cy) = self.object.pivot();
         let mut x = cx - w * dpi / 2.0;
-        if self.note_open {
-            // 읽는 동안: 쪽지가 화면 밖으로 잘리지 않게 창만 안쪽으로 민다
+        if self.widened() {
+            // 읽는 동안: 쪽지(꼬리표)가 화면 밖으로 잘리지 않게 창만 안쪽으로 민다
             let wa = world.work_area_at(cx, self.object.body.y);
             x = x.clamp(wa.left, (wa.right - w * dpi).max(wa.left));
         }
@@ -149,16 +200,13 @@ impl Live {
         let dpi = self.object.dpi();
         let (w, _) = self.logical_size();
         let dx = self.last_pos.map_or(0.0, |(x, _)| (self.object.pivot().0 - (x as f64 + w * dpi / 2.0)) / dpi);
-        let dx = if self.note_open { dx } else { 0.0 };
+        let dx = if self.widened() { dx } else { 0.0 };
         PosePayload { angle: self.object.angle(), dx }
     }
 
     fn set_scale(&mut self, app: &AppHandle, scale: f64) {
         self.object.set_scale(scale);
-        let (w, h) = self.logical_size();
-        let dpi = self.object.dpi();
-        crate::overlay::resize_quietly(&self.window, self.hwnd, (w * dpi).round() as u32, (h * dpi).round() as u32);
-        self.last_pos = None;
+        self.resize();
         let side = shape_of(self.object.kind).window_side_at(scale);
         let _ = app.emit_to(self.label.as_str(), "object-scale", ScalePayload { scale, side });
     }
@@ -168,19 +216,16 @@ impl Live {
             return;
         }
         self.note_open = open;
-        let (w, h) = self.logical_size();
-        let dpi = self.object.dpi();
-        crate::overlay::resize_quietly(&self.window, self.hwnd, (w * dpi).round() as u32, (h * dpi).round() as u32);
-        self.last_pos = None;
+        self.resize();
     }
 }
 
 /// 창을 기다리는 똥 (틱마다 하나씩 — 창 만들기는 메인 스레드를 기다린다). 받은 쓰레기 줄과 따로 세어 서로 밀어내지 않는다
 enum WaitingPoop {
-    /// 동물이 쌌다
-    Dropped { kind: ObjectKind, x: f64, y: f64, scale: f64 },
-    /// 친구가 던졌다
-    Tossed(AcceptedToss, Side, f64),
+    /// 동물이 쌌다 (tag = 손님 동물이면 보낸 이 꼬리표)
+    Dropped { kind: ObjectKind, x: f64, y: f64, scale: f64, tag: Option<String> },
+    /// 친구가 던졌다 (크기, 보낸 이 꼬리표)
+    Tossed(AcceptedToss, Side, f64, Option<String>),
 }
 
 pub struct Objects {
@@ -188,7 +233,7 @@ pub struct Objects {
     live: Vec<Live>,
     roster: Roster,
     /// 받았지만 아직 창을 만들지 않은 물건 (틱마다 하나씩)
-    inbox: TossInbox<(AcceptedToss, Side)>,
+    inbox: TossInbox<(AcceptedToss, Side, Option<String>)>,
     poop_queue: VecDeque<WaitingPoop>,
     fading: crate::overlay::Fading,
     /// 물건이 있을 때만 맞춘다 (물건 키에 맞춘 세계)
@@ -258,8 +303,15 @@ impl Objects {
             ObjectInput::Down { label } => {
                 if !busy && !self.is_held() {
                     if let Some(l) = self.find(&label) {
+                        // 잡으면 꼬리표는 접는다 (넓은 창이 화면 끝에 밀려 그림이 잘리지 않게)
+                        l.hide_tag(app);
                         l.object.pointer_down(cursor.0, cursor.1);
                     }
+                }
+            }
+            ObjectInput::Hover { label } => {
+                if let Some(l) = self.find(&label).filter(|l| !l.object.is_held()) {
+                    l.show_tag(app, Instant::now() + TAG_HOVER);
                 }
             }
             ObjectInput::EditPostit { label } => {
@@ -318,12 +370,13 @@ impl Objects {
         let y = (cursor.1 - size / 2.0).clamp(b.top + size, b.bottom.max(b.top + size));
         let mut object = Object::new(kind, x, y, dpi, fastrand::u64(..));
         object.set_scale(scale);
-        self.admit(id, window, object, Origin::Own);
+        self.admit(id, window, object, Origin::Own, None);
     }
 
-    /// 동물이 쌌다: (x, y)에서 떨어지기 시작한다. 창은 tick이 만든다
-    pub fn drop_poop(&mut self, kind: ObjectKind, x: f64, y: f64, scale: f64) {
-        self.queue_poop(WaitingPoop::Dropped { kind, x, y, scale });
+    /// 동물이 쌌다: (x, y)에서 떨어지기 시작한다. 창은 tick이 만든다. guest_owner = 손님 동물이면 주인 이름 (보낸 이 꼬리표)
+    pub fn drop_poop(&mut self, kind: ObjectKind, x: f64, y: f64, scale: f64, guest_owner: Option<&str>) {
+        let tag = guest_owner.and_then(|name| sender_tag(Arrival::GuestPoop, name));
+        self.queue_poop(WaitingPoop::Dropped { kind, x, y, scale, tag });
     }
 
     fn queue_poop(&mut self, poop: WaitingPoop) {
@@ -368,12 +421,15 @@ impl Objects {
             return;
         };
         let side = from_net_side(toss.side, toss.vside);
+        // 누가 보냈나: 친구가 보낸 이름이 아니라 내 친구 목록의 이름 (별명이 있으면 별명)
+        let arrival = if toss.bounced { Arrival::Bounced } else { Arrival::Thrown };
+        let tag = config.friend(from).and_then(|f| sender_tag(arrival, f.shown_name()));
         if accepted.kind.is_poop() {
             // 메뉴로 꺼도 친구가 던진 똥은 받는다 (끄는 건 동물이 싸는 것뿐, 받기 싫으면 집중·하우스)
-            self.queue_poop(WaitingPoop::Tossed(accepted, side, screenpet_core::poop::sanitize_size(toss.scale)));
+            self.queue_poop(WaitingPoop::Tossed(accepted, side, screenpet_core::poop::sanitize_size(toss.scale), tag));
             return;
         }
-        if let Some(old) = self.inbox.push((accepted, side), &mut self.roster) {
+        if let Some(old) = self.inbox.push((accepted, side, tag), &mut self.roster) {
             if let Some(i) = self.live.iter().position(|l| l.id == old) {
                 let l = self.live.remove(i);
                 self.poof(l);
@@ -392,7 +448,7 @@ impl Objects {
             self.admit_poop(app, base, poop);
             return;
         }
-        let Some((accepted, side)) = self.inbox.pop() else { return };
+        let Some((accepted, side, tag)) = self.inbox.pop() else { return };
         let id = self.next_id();
         let scale = self.scale_of(accepted.kind);
         let Some(window) = build_window(app, id, accepted.kind, accepted.note.is_some(), scale) else { return };
@@ -401,7 +457,7 @@ impl Objects {
         let mut object = Object::flown_in(accepted.kind, world, side, accepted.fling, dpi, fastrand::u64(..));
         object.set_scale(scale);
         object.receive_note(accepted.note);
-        self.admit(id, window, object, Origin::Foreign);
+        self.admit(id, window, object, Origin::Foreign, tag);
     }
 
     fn admit_poop(&mut self, app: &AppHandle, base: &World, poop: WaitingPoop) {
@@ -410,8 +466,8 @@ impl Objects {
             WaitingPoop::Dropped { kind, .. } => *kind,
             WaitingPoop::Tossed(accepted, ..) => accepted.kind,
         };
-        let scale = match &poop {
-            WaitingPoop::Dropped { scale, .. } | WaitingPoop::Tossed(_, _, scale) => *scale,
+        let (scale, tag) = match &poop {
+            WaitingPoop::Dropped { scale, tag, .. } | WaitingPoop::Tossed(_, _, scale, tag) => (*scale, tag.clone()),
         };
         let Some(window) = build_window(app, id, kind, false, scale) else { return };
         let dpi = window.scale_factor().unwrap_or(1.0);
@@ -422,11 +478,11 @@ impl Objects {
                 let margin = OBJECT_LOGICAL_SIZE * dpi / 2.0;
                 Object::new(kind, x.clamp(b.left + margin, (b.right - margin).max(b.left + margin)), y, dpi, fastrand::u64(..))
             }
-            WaitingPoop::Tossed(accepted, side, _) => Object::flown_in(accepted.kind, world, side, accepted.fling, dpi, fastrand::u64(..)),
+            WaitingPoop::Tossed(accepted, side, ..) => Object::flown_in(accepted.kind, world, side, accepted.fling, dpi, fastrand::u64(..)),
         };
         let mut object = object;
         object.set_scale(scale);
-        self.admit(id, window, object, Origin::Poop);
+        self.admit(id, window, object, Origin::Poop, tag);
     }
 
     fn next_id(&mut self) -> u64 {
@@ -440,7 +496,8 @@ impl Objects {
     }
 
     /// 물건 수를 지키며 들인다: 넘치면 그 쪽(내 것 10 / 받은 것 20 / 똥 10)의 가장 오래된 것이 뿅 사라진다
-    fn admit(&mut self, id: u64, window: WebviewWindow, object: Object, origin: Origin) {
+    /// tag = 친구 화면에서 왔으면 보낸 이 꼬리표 (처음 내려앉을 때 보인다)
+    fn admit(&mut self, id: u64, window: WebviewWindow, object: Object, origin: Origin, tag: Option<String>) {
         if let Some(old) = self.roster.add(id, origin) {
             if let Some(i) = self.live.iter().position(|l| l.id == old) {
                 let l = self.live.remove(i);
@@ -458,6 +515,9 @@ impl Objects {
             last_pos: None,
             last_pose: PosePayload { angle: 0.0, dx: 0.0 },
             note_open: false,
+            tag_on_land: tag.is_some(),
+            tag,
+            tag_until: None,
             hwnd,
         });
     }
@@ -558,6 +618,7 @@ impl Objects {
             } else if l.object.pointer_up() == Release::Click {
                 // 받은 포스트잇을 눌렀다: 글자는 이때 처음 웹뷰로 가고, 코어에서는 지워진다
                 if let Some(text) = l.object.read_note() {
+                    l.hide_tag(app);
                     l.set_note_open(true);
                     set_postit_state(&l.label, Some(l.object.postit()));
                     let _ = app.emit_to(l.label.as_str(), "object-sticker", false);
@@ -587,7 +648,14 @@ impl Objects {
                 l.set_note_open(false);
                 set_postit_state(&l.label, Some(l.object.postit()));
             }
+            if l.tag_until.is_some_and(|t| now >= t) {
+                l.hide_tag(app);
+            }
             let asleep = l.object.is_asleep();
+            // 친구가 보낸 물건이 처음 내려앉았다: 누가 보냈는지 잠깐 보인다
+            if asleep && std::mem::take(&mut l.tag_on_land) {
+                l.show_tag(app, now + TAG_ARRIVE);
+            }
             // 잠든 물건은 창이 제자리에 있으면 아무것도 하지 않는다 (reseat가 옮겼으면 last_pos와 달라진다)
             l.place(world);
             if asleep && was_asleep && l.last_pose == l.pose() {
@@ -735,6 +803,14 @@ fn is_object_label(label: &str) -> bool {
 pub fn object_down(window: WebviewWindow, state: State<AppState>) {
     if is_object_label(window.label()) {
         state.send(Input::Object(ObjectInput::Down { label: window.label().to_string() }));
+    }
+}
+
+/// 물건에 마우스를 올렸다 — 친구가 보낸 물건이면 보낸 이 꼬리표를 다시 보인다
+#[tauri::command]
+pub fn object_hover(window: WebviewWindow, state: State<AppState>) {
+    if is_object_label(window.label()) {
+        state.send(Input::Object(ObjectInput::Hover { label: window.label().to_string() }));
     }
 }
 

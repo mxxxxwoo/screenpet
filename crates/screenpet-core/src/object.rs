@@ -829,6 +829,39 @@ pub fn accept_toss(kind: &str, fling: Option<Fling>, note: Option<&str>) -> Opti
     Some(AcceptedToss { kind, fling: Fling { height: fling.height, vx, vy }, note })
 }
 
+/// 친구 화면에서 온 물건이 어떻게 왔나 (보낸 이 꼬리표 앞 그림)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrival {
+    /// 친구가 던졌다 🎯
+    Thrown,
+    /// 내가 던진 것을 친구가 되돌려 보냈다 ↩
+    Bounced,
+    /// 놀러 온 친구 동물이 내 화면에 쌌다 🐾
+    GuestPoop,
+}
+
+/// 보낸 이 꼬리표에 보일 이름 최대 글자 수 (넘치면 …)
+pub const SENDER_TAG_CHARS: usize = 12;
+
+/// 물건 위에 잠깐 뜨는 "누가 보냈나" 꼬리표 글자. name = 내 친구 목록에 보이는 이름 (친구가 보낸 글자가 아니다).
+/// 이름이 비면 꼬리표가 없다
+pub fn sender_tag(arrival: Arrival, name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let icon = match arrival {
+        Arrival::Thrown => "🎯",
+        Arrival::Bounced => "↩",
+        Arrival::GuestPoop => "🐾",
+    };
+    let mut shown: String = name.chars().take(SENDER_TAG_CHARS).collect();
+    if name.chars().count() > SENDER_TAG_CHARS {
+        shown.push('…');
+    }
+    Some(format!("{icon} {shown}"))
+}
+
 /// 물건이 어디서 왔나
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {

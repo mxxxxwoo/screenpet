@@ -86,6 +86,35 @@
         }
       }
 
+      /* 보낸 이 꼬리표 "🎯 철수": 친구 화면에서 온 물건 위에 잠깐 (자리는 object.js, 글자는 textContent로만) */
+      #tag {
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        max-width: calc(100% - 8px);
+        padding: 1px 7px;
+        box-sizing: border-box;
+        background: rgba(255, 250, 242, 0.9);
+        color: #84605c;
+        border: 1px solid #84605c;
+        border-radius: 9px;
+        font: 600 11px/1.2 "Segoe UI", "Malgun Gothic", sans-serif;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        pointer-events: none;
+        animation: tag 200ms ease-out both;
+      }
+      @keyframes tag {
+        from {
+          opacity: 0;
+          transform: translate(-50%, 4px);
+        }
+        to {
+          opacity: 1;
+          transform: translateX(-50%);
+        }
+      }
       body.poof #thing {
         animation: poof 300ms ease-in forwards;
       }
@@ -118,6 +147,13 @@
       body.pixel #sticker {
         animation: none;
       }
+      body.pixel #tag {
+        border: 0;
+        border-radius: 0;
+        background: #fffaf2;
+        box-shadow: 0 -1px 0 #84605c, 0 1px 0 #84605c, -1px 0 0 #84605c, 1px 0 0 #84605c;
+        animation: none;
+      }
       body.pixel #note {
         border-radius: 0;
         box-shadow: 2px 2px 0 rgba(90, 70, 20, 0.45);
@@ -140,6 +176,7 @@
   </head>
   <body>
     <div id="note" hidden></div>
+    <div id="tag" hidden></div>
     <div id="thing">
       <img id="art" alt="" draggable="false" />
       <img id="sticker" alt="" draggable="false" src="objects/postit.png" hidden />
