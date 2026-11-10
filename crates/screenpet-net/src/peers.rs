@@ -15,7 +15,7 @@
 
 use crate::discovery::{note_dial, pick_candidate};
 use crate::noise::{self, Established};
-use crate::protocol::{clamp_name, Control, Message, MAX_FRAME, MAX_FRIENDS, MAX_ID, PROTOCOL_VERSION};
+use crate::protocol::{clamp_name, Control, Message, DEVICES_MIN_VERSION, MAX_FRAME, MAX_FRIENDS, MAX_ID, PROTOCOL_VERSION};
 use crate::secure::SecureLink;
 use crate::transport::{self, FrameLink, FrameReader, Recv};
 use crate::{
@@ -54,6 +54,11 @@ fn ctl(c: Control) -> Message {
 
 fn pairing_active(c: &Conn) -> bool {
     matches!(&c.kind, Kind::Stranger(Some(p)) if !matches!(p.stage, PairStage::Failed))
+}
+
+/// Is any pairing (either direction) with `id` in progress?
+pub(crate) fn pairing_with(st: &State, id: &str) -> bool {
+    st.conns.values().any(|c| c.peer_id == id && pairing_active(c))
 }
 
 /// Is one of *our own* outgoing pairings to `id` in progress? (Inbound links
@@ -98,6 +103,12 @@ pub(crate) fn run_session(
         cleanup(&shared, None, dialed.as_deref());
         return DialOutcome::Failed;
     };
+    // 📱 On standby no friend gets in (my linked computer does): closed before any hello
+    if shared.state().standby_refuses_key(&remote_static) {
+        frames.close();
+        cleanup(&shared, None, dialed.as_deref());
+        return DialOutcome::Failed;
+    }
     let transport = Arc::new(Mutex::new(transport));
     let Some(link) = SecureLink::start(&shared, frames.clone(), transport.clone()) else {
         frames.close();
@@ -207,6 +218,9 @@ fn register(shared: &Shared, ctx: &Ctx, id: &str, name: &str, peer_pinned_us: bo
         let mut st = shared.state();
         let pinned = st.friend_key(id);
         match pinned {
+            // A key only a friend's introduction vouches for: whoever this is
+            // may still pair for real (as a stranger, SAS-confirmed).
+            Some(k) if k != ctx.remote_key && st.introduced_only(id) => {}
             Some(k) if k != ctx.remote_key => {
                 // Unproven: whoever answered is not our friend. Silent; the
                 // dialed candidate is backed off by the caller.
@@ -215,24 +229,41 @@ fn register(shared: &Shared, ctx: &Ctx, id: &str, name: &str, peer_pinned_us: bo
             None if st.friends.iter().any(|f| f.public_key == ctx.remote_key) => return Reg::Reject,
             _ => {}
         }
-        let friend_link = pinned.is_some();
+        let friend_link = pinned == Some(ctx.remote_key);
         if friend_link && !peer_pinned_us {
             // The pinned key itself says it does not have us (`pinned` matched
             // `remote_key` above, proven by the Noise handshake). A hello sent
             // just before the peer pinned us can still arrive right after we
-            // pinned it; that one means nothing, so only back off.
+            // pinned it; that one means nothing, so only back off. The same for
+            // a friend added without pairing (another computer of mine or an
+            // introduction): its news of us may not have arrived yet — up to
+            // `PENDING_STRIKES` times; then it really doesn't know us.
             if st.just_paired(id, now) {
                 st.back_off(Backoff::Id(id.to_string()), shared.timing.peer_timeout, now);
+                return Reg::NotMutual;
+            }
+            if st.pending.contains_key(id) {
+                let denied = st.pending_denied.entry(id.to_string()).or_insert(0);
+                *denied += 1;
+                if *denied < crate::devices::PENDING_STRIKES {
+                    st.back_off(Backoff::Id(id.to_string()), shared.timing.peer_timeout, now);
+                    return Reg::NotMutual;
+                }
+                let dropped = crate::devices::drop_pending(shared, &mut st, id);
+                drop(st);
+                crate::devices::close_dropped(dropped);
                 return Reg::NotMutual;
             }
             st.remove_friend(id);
             st.invites_out.remove(id);
             let stale = st.demote_friend_link(id);
             shared.emit(NetEvent::FriendForgotUs { id: id.to_string() });
+            let dropped = crate::devices::drop_introduced(shared, &mut st, id);
             drop(st);
             if let Some(l) = stale {
                 l.close(); // `announced` stays: Disconnected follows
             }
+            crate::devices::close_dropped(dropped);
             return Reg::NotMutual;
         }
         if !friend_link && peer_pinned_us {
@@ -259,6 +290,9 @@ fn register(shared: &Shared, ctx: &Ctx, id: &str, name: &str, peer_pinned_us: bo
             st.trust_ip(id, &ctx.peer_addr, now);
             st.friend_wait.remove(id);
             st.backoff.remove(&Backoff::Id(id.to_string()));
+            // It pinned us too: no longer unconfirmed
+            st.pending.remove(id);
+            st.pending_denied.remove(id);
             st.friend_links.insert(id.to_string(), ctx.token);
             Kind::Friend
         } else if outgoing {
@@ -277,6 +311,13 @@ fn register(shared: &Shared, ctx: &Ctx, id: &str, name: &str, peer_pinned_us: bo
         } else {
             Kind::Stranger(None)
         };
+        // My linked computer proves our secret again on every new link
+        let mut dev = crate::devices::DevLink::default();
+        if friend_link && v >= DEVICES_MIN_VERSION && st.device.as_ref().is_some_and(|(d, _)| d == id) {
+            let nonce = crate::devices::link_nonce();
+            dev.mine = Some(nonce);
+            first_msg = Some(Control::DeviceNonce { nonce: noise::to_hex(&nonce) });
+        }
         let connected = friend_link && !announced;
         st.conns.insert(
             ctx.token,
@@ -294,6 +335,7 @@ fn register(shared: &Shared, ctx: &Ctx, id: &str, name: &str, peer_pinned_us: bo
                 hs_hash: ctx.hs_hash,
                 since: now,
                 unverified: ctx.unverified.clone(),
+                dev,
             },
         );
         if connected {
@@ -316,7 +358,8 @@ fn register(shared: &Shared, ctx: &Ctx, id: &str, name: &str, peer_pinned_us: bo
 /// list can have filled up since the invite (pairings run side by side): then
 /// this pairing ends in a refusal instead.
 fn pin(shared: &Shared, st: &mut State, token: u64) -> Vec<Arc<SecureLink>> {
-    let full = st.friends.len() >= MAX_FRIENDS;
+    let Some(id) = st.conns.get(&token).map(|c| c.peer_id.clone()) else { return Vec::new() };
+    let full = st.friends.len() >= MAX_FRIENDS && !st.is_friend(&id);
     let Some(conn) = st.conns.get_mut(&token) else { return Vec::new() };
     if full {
         let (id, link) = (conn.peer_id.clone(), conn.link.clone());
@@ -331,7 +374,11 @@ fn pin(shared: &Shared, st: &mut State, token: u64) -> Vec<Arc<SecureLink>> {
     conn.announced = true;
     shared.release_unverified(&conn.unverified);
     let (id, key, name, addr) = (conn.peer_id.clone(), conn.remote_key, conn.name.clone(), conn.peer_addr.clone());
+    // Replaces an unconfirmed introduction of this id (`register`): now a plain friend
     st.add_friend(&id, key);
+    st.via.remove(&id);
+    st.pending.remove(&id);
+    st.pending_denied.remove(&id);
     st.paired_at.insert(id.clone(), Instant::now());
     st.trust_ip(&id, &addr, Instant::now());
     st.friend_links.insert(id.clone(), token);
@@ -525,6 +572,7 @@ fn handle(shared: &Shared, ctx: &Ctx, id: &str, name: &str, msg: Message) -> boo
             }
             st.conns.get_mut(&ctx.token).expect("current conn").kind = Kind::Stranger(None);
             st.remove_friend(id);
+            let dropped = crate::devices::drop_introduced(shared, &mut st, id);
             // Also drop any other friend link for this id (e.g. one that
             // registered while this message was in flight).
             let other = st.friend_links.remove(id).filter(|t| *t != ctx.token);
@@ -536,7 +584,49 @@ fn handle(shared: &Shared, ctx: &Ctx, id: &str, name: &str, msg: Message) -> boo
             if let Some(l) = other {
                 l.close();
             }
+            crate::devices::close_dropped(dropped);
             false
+        }
+        // Friend lists between my computers and introductions: authenticated
+        // friend links only, budgeted per friend; `devices` checks the rest
+        Message::Control(Control::DeviceFriends { friends, want }) => {
+            if matches!(conn.kind, Kind::Friend) && conn.dev.proven && st.is_friend(id) && st.budget(id, now).links.take(now) {
+                crate::devices::on_device_friends(shared, &mut st, id, friends, want);
+            }
+            true
+        }
+        // Linking by code and proving the stored secret: friend links of
+        // builds that know them only, budgeted per friend; `devices` checks the rest
+        Message::Control(
+            c @ (Control::DeviceCode { .. }
+            | Control::DeviceCodeNonce { .. }
+            | Control::DeviceCodeProof { .. }
+            | Control::DeviceCodeOk { .. }
+            | Control::DeviceNo { .. }
+            | Control::DeviceNonce { .. }
+            | Control::DeviceProof { .. }
+            | Control::DeviceUnlink
+            | Control::DeviceConfirm
+            | Control::DeviceActive { .. }
+            | Control::DeviceState { .. }),
+        ) => {
+            // (shared pets have their own bucket: they never starve a claim)
+            let state = matches!(c, Control::DeviceState { .. });
+            if !(matches!(conn.kind, Kind::Friend) && conn.v >= DEVICES_MIN_VERSION && st.is_friend(id) && st.budget(id, now).device(state, now)) {
+                return true;
+            }
+            let replies = crate::devices::on_link_message(shared, &mut st, ctx.token, id, c);
+            drop(st);
+            for r in replies {
+                ctx.link.send(&ctl(r));
+            }
+            true
+        }
+        Message::Control(Control::MyDevices { devices }) => {
+            if matches!(conn.kind, Kind::Friend) && st.is_friend(id) && st.budget(id, now).links.take(now) {
+                crate::devices::on_my_devices(shared, &mut st, id, devices);
+            }
+            true
         }
         Message::Visit(v) => {
             if matches!(conn.kind, Kind::Friend) && st.is_friend(id) && st.budget(id, now).visits.take(now) {
@@ -587,6 +677,10 @@ fn cleanup(shared: &Shared, token: Option<u64>, dialed: Option<&str>) {
         st.invites_out.remove(d);
     }
     let Some(conn) = token.and_then(|t| st.conns.remove(&t)) else { return };
+    if conn.dev.confirming.is_some() {
+        // 📱 the link went away before both confirmed: cancelled, nothing kept
+        shared.emit(NetEvent::DeviceLinkCancelled { id: conn.peer_id.clone() });
+    }
     if st.friend_links.get(&conn.peer_id) == token.as_ref() {
         st.friend_links.remove(&conn.peer_id);
     }
@@ -638,7 +732,7 @@ pub(crate) fn dial_failed(shared: &Shared, id: &str) {
 fn can_invite(shared: &Shared, st: &State, peer_id: &str) -> bool {
     peer_id != shared.id
         && !st.invites_out.contains_key(peer_id)
-        && !st.is_friend(peer_id)
+        && (!st.is_friend(peer_id) || st.introduced_only(peer_id))
         && st.friends.len() < MAX_FRIENDS
         && !st.dialing.contains(peer_id)
         && !outbound_pairing(st, peer_id)

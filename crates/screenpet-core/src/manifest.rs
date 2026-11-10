@@ -11,12 +11,11 @@ pub const REQUIRED_ANIMS: [&str; 21] = [
     "tickle", "annoyed", "hungry", "eat", "level_up",
 ];
 
-/// 특정 동물만 가진 동작 — 있으면 검증한다 (behavior::Special::anim_name, 벽 타기 climb/slide, 꿀벌 sting, 개구리 bigjump,
+/// 특정 동물만 가진 동작 — 있으면 검증한다 (behavior::Special::anim_name, 벽 타기 climb/slide, 개구리 bigjump,
 /// 기린 neckstretch — 있으면 구르는 대신 목을 늘인다, 올려다보기 lookup — 없으면 그냥 쳐다본다(look)).
 /// 개구리의 폴짝(hop)은 모든 동물의 필수 동작이라 REQUIRED_ANIMS에 이미 있다. 순서는 tools/sprite_spec.py OPTIONAL_ANIMS와 같다
 /// 공룡 fire·roar·stomp — 있으면 쉬거나 간질일 때 셋 중 하나 (Special::Fire/Roar/Stomp, 쿵쾅은 친구들을 흔든다).
-pub const OPTIONAL_ANIMS: [&str; 12] =
-    ["arch", "wag", "huff", "climb", "slide", "sting", "bigjump", "neckstretch", "lookup", "fire", "roar", "stomp"];
+pub const OPTIONAL_ANIMS: [&str; 11] = ["arch", "huff", "climb", "slide", "bigjump", "neckstretch", "lookup", "fire", "roar", "stomp", "surprise"];
 
 /// 이동 방식 (pet.json `locomotion`, 없으면 walk)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -25,20 +24,18 @@ pub enum Locomotion {
     /// 디딤판 위를 걷는다
     #[default]
     Walk,
-    /// 날아다닌다 (꿀벌) — 쉴 때 가끔 창 윗면·바닥에 내려앉는다
+    /// 날아다닌다 (유령·새) — 쉴 때 가끔 창 윗면·바닥에 내려앉는다
     Fly,
     /// 폴짝폴짝 뛰어다닌다 (개구리) — 가끔 크게 뛰어 창 위로, 벽은 폴짝폴짝 오른다 (hop.rs)
     Hop,
 }
 
-/// 사는 집 그림 (pet.json `house`, 없으면 sting이 있는 꿀벌은 벌통·나머지는 보통 집)
+/// 사는 집 그림 (pet.json `house`, 없으면 보통 집)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HouseKind {
     /// 보통 집 (ui/house/house_<stage>)
     House,
-    /// 꿀벌 벌통 (ui/house/hive_<stage>)
-    Hive,
     /// 호박·유령의 귀신의 집 (ui/house/haunted_<stage>)
     Haunted,
     /// 루돌프·산타의 눈 덮인 크리스마스 벽돌집 (ui/house/xmas_<stage>, 굴뚝 연기는 ui/house.js가 피운다)
@@ -95,12 +92,15 @@ pub struct PetManifest {
     /// 걷는 동물이 걷기·달리기 토막 중 깡총거리는 몫 0~1 (토끼 0.5, 없으면 0 — 개구리는 locomotion hop이라 늘 폴짝)
     #[serde(default)]
     pub hop_share: f64,
-    /// 사는 집 (없으면 house_kind()가 sting으로 정한다)
+    /// 사는 집 (없으면 보통 집)
     #[serde(default)]
     pub house: Option<HouseKind>,
     /// 가끔 머리 위에 작은 눈구름을 부른다 (눈사람)
     #[serde(default)]
     pub snow_cloud: bool,
+    /// 빠른 나는 동물 (새) — locomotion fly일 때만 뜻이 있다. 모르는 칸이라 옛 앱은 그냥 무시한다
+    #[serde(default)]
+    pub swift: bool,
     /// 칸마다 머리 꼭대기 (단계 → 동작 → 칸별 [x, y, 너비, 기울기] 칸 px — 그림 생성기가 적는다)
     #[serde(default)]
     pub head: HashMap<String, HashMap<String, Vec<[f64; 4]>>>,
@@ -226,7 +226,7 @@ impl PetManifest {
         self.locomotion == Locomotion::Hop
     }
 
-    /// 걷기·달리기 토막 중 깡총거리는 몫 (폴짝 동물·나는 동물은 0 — 개구리는 늘 폴짝, 꿀벌은 난다)
+    /// 걷기·달리기 토막 중 깡총거리는 몫 (폴짝 동물·나는 동물은 0 — 개구리는 늘 폴짝, 유령·새는 난다)
     pub fn hop_share(&self) -> f64 {
         if self.locomotion == Locomotion::Walk { self.hop_share } else { 0.0 }
     }
@@ -236,14 +236,9 @@ impl PetManifest {
         self.has_anim("lookup")
     }
 
-    /// 괴롭히면 화면을 쏜다 (pet.json에 sting이 있는 꿀벌)
-    pub fn can_sting(&self) -> bool {
-        self.has_anim("sting")
-    }
-
-    /// 사는 집 그림: pet.json `house`, 없으면 sting이 있는 동물(꿀벌)은 벌통 (예전 pet.json 호환), 나머지는 보통 집
+    /// 사는 집 그림: pet.json `house`, 없으면 보통 집
     pub fn house_kind(&self) -> HouseKind {
-        self.house.unwrap_or(if self.can_sting() { HouseKind::Hive } else { HouseKind::House })
+        self.house.unwrap_or(HouseKind::House)
     }
 
     /// 이 동물의 단계별 크기 배율 (care::Stage::scale에 곱한다)
@@ -326,15 +321,15 @@ mod tests {
     fn optional_specials_are_validated_when_present() {
         let with_arch = full_json().replace(r#""animations": {"#, r#""animations": {"arch": {"row": 18, "frames": 3, "fps": 6},"#);
         assert!(parse_manifest(&with_arch).unwrap().has_anim("arch"));
-        assert!(!parse_manifest(&full_json()).unwrap().has_anim("wag"));
-        let bad = full_json().replace(r#""animations": {"#, r#""animations": {"wag": {"row": 18, "frames": 0, "fps": 8},"#);
+        assert!(!parse_manifest(&full_json()).unwrap().has_anim("huff"));
+        let bad = full_json().replace(r#""animations": {"#, r#""animations": {"huff": {"row": 18, "frames": 0, "fps": 8},"#);
         assert!(parse_manifest(&bad).is_err());
     }
 
     #[test]
     fn climbing_needs_both_climb_and_slide() {
         let add = |extra: &str| full_json().replace(r#""animations": {"#, &format!(r#""animations": {{{extra}"#));
-        assert_eq!(OPTIONAL_ANIMS[2..5], ["huff", "climb", "slide"]);
+        assert_eq!(OPTIONAL_ANIMS[1..4], ["huff", "climb", "slide"]);
         assert!(!parse_manifest(&full_json()).unwrap().can_climb());
         assert!(!parse_manifest(&add(r#""climb": {"row": 21, "frames": 4, "fps": 8},"#)).unwrap().can_climb());
         let both = add(r#""climb": {"row": 21, "frames": 4, "fps": 8}, "slide": {"row": 22, "frames": 2, "fps": 6},"#);
@@ -376,9 +371,9 @@ mod tests {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../ui/pets/{id}/pet.json"));
             parse_manifest(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        let (cat, dog, bear, rabbit) = (load("cat"), load("dog"), load("bear"), load("rabbit"));
-        assert_eq!((cat.personality, dog.personality), (Personality::Aloof, Personality::Friendly));
-        assert_eq!(bear.size_mult(Stage::Teenager), 0.89);
+        let (cat, rudolph, rabbit) = (load("cat"), load("rudolph"), load("rabbit"));
+        assert_eq!((cat.personality, rudolph.personality), (Personality::Aloof, Personality::Friendly));
+        assert_eq!(rudolph.size_mult(Stage::Teenager), 0.84);
         assert_eq!(rabbit.size_mult(Stage::Baby), 0.85);
         assert_eq!(cat.size_mult(Stage::Adult), 0.91);
     }
@@ -403,6 +398,17 @@ mod tests {
         }
     }
 
+    /// 새: swift는 나는 동물에게만 뜻이 있다 (걷는 동물에 적혀 있어도 PetConfig::swift는 꺼진다). 없으면 false
+    #[test]
+    fn swift_defaults_off_and_only_counts_for_flyers() {
+        assert!(!parse_manifest(&full_json()).unwrap().swift);
+        let walker = full_json().replace(r#""walk_speed": 60,"#, r#""walk_speed": 60, "swift": true,"#);
+        let m = parse_manifest(&walker).unwrap();
+        assert!(m.swift && !crate::brain::PetConfig::from_manifest(&m, 1.0, 1.0, "teenager").swift);
+        let flyer = walker.replace(r#""swift": true,"#, r#""swift": true, "locomotion": "fly","#);
+        assert!(crate::brain::PetConfig::from_manifest(&parse_manifest(&flyer).unwrap(), 1.0, 1.0, "teenager").swift);
+    }
+
     #[test]
     fn locomotion_defaults_to_walk_and_parses_fly() {
         assert_eq!(parse_manifest(&full_json()).unwrap().locomotion, Locomotion::Walk);
@@ -420,7 +426,7 @@ mod tests {
         assert_eq!(m.locomotion, Locomotion::Hop);
         assert!(m.hops() && !m.flies() && m.has_anim("bigjump"));
         assert_eq!(m.personality, Personality::Playful);
-        assert_eq!(OPTIONAL_ANIMS[6], "bigjump");
+        assert_eq!(OPTIONAL_ANIMS[4], "bigjump");
         let bad = full_json().replace(r#""animations": {"#, r#""animations": {"bigjump": {"row": 21, "frames": 0, "fps": 8},"#);
         assert!(parse_manifest(&bad).is_err());
     }
@@ -431,7 +437,7 @@ mod tests {
         let m = parse_manifest(&json).unwrap();
         assert!(m.has_anim("neckstretch"));
         assert_eq!(crate::behavior::Special::from_manifest(|n| m.has_anim(n)), Some(crate::behavior::Special::NeckStretch));
-        assert_eq!(OPTIONAL_ANIMS[7], "neckstretch");
+        assert_eq!(OPTIONAL_ANIMS[5], "neckstretch");
         let bad = full_json().replace(r#""animations": {"#, r#""animations": {"neckstretch": {"row": 21, "frames": 0, "fps": 2},"#);
         assert!(parse_manifest(&bad).is_err());
     }
@@ -439,7 +445,8 @@ mod tests {
     /// 올려다보기: 선택 동작의 맨 끝 — 있으면 can_look_up, 없으면 그냥 쳐다본다
     #[test]
     fn parses_lookup_as_the_last_optional_anim() {
-        assert_eq!(OPTIONAL_ANIMS[8], "lookup");
+        assert_eq!(OPTIONAL_ANIMS[6], "lookup");
+        assert_eq!(OPTIONAL_ANIMS[10], "surprise"); // 레서판다 깜짝 (v0.5.5)
         assert!(!parse_manifest(&full_json()).unwrap().can_look_up());
         let json = full_json().replace(r#""animations": {"#, r#""animations": {"lookup": {"row": 21, "frames": 3, "fps": 3},"#);
         assert!(parse_manifest(&json).unwrap().can_look_up());
@@ -451,16 +458,16 @@ mod tests {
     #[test]
     fn bundled_pets_look_up() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/pets");
-        for id in ["cat", "dog", "rabbit", "bear", "bee", "frog", "pumpkin", "ghost", "duck", "giraffe", "rudolph", "santa", "snowman"] {
-            let json = std::fs::read_to_string(dir.join(id).join("pet.json")).unwrap();
+        for id in crate::test_util::species() {
+            let json = std::fs::read_to_string(dir.join(&id).join("pet.json")).unwrap();
             assert!(parse_manifest(&json).unwrap().can_look_up(), "{id}");
         }
     }
 
-    /// 공룡: 선택 동작 맨 끝의 fire·roar·stomp → 공룡 특별 동작 (셋 중 하나를 고른다)
+    /// 공룡: lookup 뒤의 fire·roar·stomp → 공룡 특별 동작 (셋 중 하나를 고른다)
     #[test]
     fn parses_dino_anims_as_the_dino_special() {
-        assert_eq!(OPTIONAL_ANIMS[OPTIONAL_ANIMS.len() - 3..], ["fire", "roar", "stomp"]);
+        assert_eq!(OPTIONAL_ANIMS[7..10], ["fire", "roar", "stomp"]);
         let json = full_json().replace(
             r#""animations": {"#,
             r#""animations": {"fire": {"row": 21, "frames": 4, "fps": 4, "loop": false}, "roar": {"row": 22, "frames": 3, "fps": 4}, "stomp": {"row": 23, "frames": 4, "fps": 6},"#,
@@ -508,6 +515,16 @@ mod tests {
         assert_eq!(snowman.favorite_food.as_ref().map(|f| f.name.as_str()), Some("빙수"));
     }
 
+    /// 번들 다람쥐는 고양이처럼 벽을 타고, 걷다가 가끔 깡총거리고, 도토리를 좋아한다
+    #[test]
+    fn bundled_squirrel_climbs_and_hops_now_and_then() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/pets/squirrel/pet.json");
+        let m = parse_manifest(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(m.can_climb() && m.locomotion == Locomotion::Walk);
+        assert!(m.hop_share() > 0.0 && m.hop_share() < 1.0);
+        assert_eq!(m.favorite_food.as_ref().map(|f| f.name.as_str()), Some("도토리"));
+    }
+
     /// 개구리 (아트 에이전트가 ui/pets/frog를 만들면 그대로 읽힌다 — 없으면 건너뛴다)
     #[test]
     fn bundled_frog_hops_and_climbs_if_present() {
@@ -515,7 +532,7 @@ mod tests {
         let Ok(json) = std::fs::read_to_string(path) else { return };
         let m = parse_manifest(&json).unwrap();
         assert_eq!(m.locomotion, Locomotion::Hop);
-        assert!(m.has_anim("bigjump") && m.can_climb() && !m.can_sting());
+        assert!(m.has_anim("bigjump") && m.can_climb());
     }
 
     #[test]
@@ -539,40 +556,28 @@ mod tests {
         assert!(!m.hops() && !m.has_anim("bigjump"));
     }
 
+    /// 곰·꿀벌·강아지는 v0.5.5에서 빠졌다 — 번들에 없고, 그들만 쓰던 동작(wag 살랑·sting 쏘기)도 선택 동작이 아니다
     #[test]
-    fn sting_is_an_optional_front_animation() {
-        assert!(OPTIONAL_ANIMS.contains(&"sting"));
-        assert!(!parse_manifest(&full_json()).unwrap().has_anim("sting"));
-        let with = full_json().replace(r#""animations": {"#, r#""animations": {"sting": {"row": 21, "frames": 3, "fps": 8, "loop": false, "front": true},"#);
-        let m = parse_manifest(&with).unwrap();
-        assert!(m.has_anim("sting") && m.animations["sting"].front);
-        let bad = full_json().replace(r#""animations": {"#, r#""animations": {"sting": {"row": 21, "frames": 0, "fps": 8},"#);
-        assert!(parse_manifest(&bad).is_err());
+    fn bear_bee_and_dog_are_no_longer_bundled() {
+        let pets = crate::test_util::species();
+        for gone in ["bear", "bee", "dog"] {
+            assert!(!pets.iter().any(|p| p == gone), "{gone}");
+        }
+        assert!(!OPTIONAL_ANIMS.contains(&"wag") && !OPTIONAL_ANIMS.contains(&"sting"));
     }
 
-    /// 꿀벌 (아트 에이전트가 ui/pets/bee를 만들면 그대로 읽힌다 — 없으면 건너뛴다)
-    #[test]
-    fn bundled_bee_flies_and_stings_if_present() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/pets/bee/pet.json");
-        let Ok(json) = std::fs::read_to_string(path) else { return };
-        let m = parse_manifest(&json).unwrap();
-        assert_eq!(m.locomotion, Locomotion::Fly);
-        assert!(m.has_anim("sting") && m.animations["sting"].front);
-        assert!(!m.can_climb());
-    }
-
-    /// 할로윈 호박: 걷는 동물인데 걷기·달리기는 늘 통통 (hop_share 1.0), 쏘기·bigjump 그림 없음 (벽 타기는 번들 pet.json의 climb·slide로 — bundled_pumpkin_climbs_and_the_ghost_does_not)
+    /// 할로윈 호박: 걷는 동물인데 걷기·달리기는 늘 통통 (hop_share 1.0), bigjump 그림 없음 (벽 타기는 번들 pet.json의 climb·slide로 — bundled_pumpkin_climbs_and_the_ghost_does_not)
     fn check_pumpkin(m: &PetManifest) {
         assert_eq!(m.locomotion, Locomotion::Walk);
         assert_eq!(m.hop_share(), 1.0);
-        assert!(!m.flies() && !m.hops() && !m.can_sting() && !m.has_anim("bigjump"));
+        assert!(!m.flies() && !m.hops() && !m.has_anim("bigjump"));
     }
 
-    /// 할로윈 유령: 날지만(locomotion fly) 쏘지 않는다 — 꽃·벌통은 꿀벌만 (can_sting)
+    /// 할로윈 유령: 둥실 날아다닌다 (locomotion fly), 벽은 타지 않는다
     fn check_ghost(m: &PetManifest) {
         assert_eq!(m.locomotion, Locomotion::Fly);
-        assert!(m.flies() && !m.can_sting() && !m.can_climb());
-        assert!(m.walk_speed < 60.0, "ghost floats slower than the bee: {}", m.walk_speed);
+        assert!(m.flies() && !m.can_climb());
+        assert!(m.walk_speed < 60.0, "ghost floats slowly: {}", m.walk_speed);
     }
 
     #[test]
@@ -604,28 +609,23 @@ mod tests {
     }
 
     #[test]
-    fn house_kind_defaults_to_normal_or_hive_for_stingers_and_parses_field() {
+    fn house_kind_defaults_to_normal_and_parses_field() {
         assert_eq!(parse_manifest(&full_json()).unwrap().house_kind(), HouseKind::House);
         let with = |v: &str| full_json().replace(r#""walk_speed": 60,"#, &format!(r#""walk_speed": 60, "house": "{v}","#));
-        assert_eq!(parse_manifest(&with("hive")).unwrap().house_kind(), HouseKind::Hive);
+        // 벌통은 꿀벌과 함께 빠졌다 (v0.5.5)
+        assert!(parse_manifest(&with("hive")).is_err());
         assert_eq!(parse_manifest(&with("haunted")).unwrap().house_kind(), HouseKind::Haunted);
         assert_eq!(parse_manifest(&with("house")).unwrap().house_kind(), HouseKind::House);
         assert!(parse_manifest(&with("castle")).is_err());
-        // 예전 pet.json (house 없음): sting이 있으면 벌통
-        let stinger = full_json().replace(r#""animations": {"#, r#""animations": {"sting": {"row": 21, "frames": 3, "fps": 8},"#);
-        assert_eq!(parse_manifest(&stinger).unwrap().house_kind(), HouseKind::Hive);
-        // 적힌 값이 sting보다 먼저
-        let haunted_stinger = stinger.replace(r#""walk_speed": 60,"#, r#""walk_speed": 60, "house": "haunted","#);
-        assert_eq!(parse_manifest(&haunted_stinger).unwrap().house_kind(), HouseKind::Haunted);
         // 루돌프·산타의 크리스마스 벽돌집
         assert_eq!(parse_manifest(&with("xmas")).unwrap().house_kind(), HouseKind::Xmas);
     }
 
-    /// 번들 pet.json: 꿀벌은 벌통, 호박·유령은 귀신의 집, 루돌프·산타는 크리스마스 벽돌집, 나머지는 보통 집
+    /// 번들 pet.json: 호박·유령은 귀신의 집, 루돌프·산타는 크리스마스 벽돌집, 나머지는 보통 집
     #[test]
     fn bundled_pets_pick_their_house() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/pets");
-        for (id, kind) in [("bee", HouseKind::Hive), ("pumpkin", HouseKind::Haunted), ("ghost", HouseKind::Haunted), ("cat", HouseKind::House),
+        for (id, kind) in [("pumpkin", HouseKind::Haunted), ("ghost", HouseKind::Haunted), ("cat", HouseKind::House),
                            ("rudolph", HouseKind::Xmas), ("santa", HouseKind::Xmas), ("snowman", HouseKind::Xmas)] {
             if let Ok(json) = std::fs::read_to_string(dir.join(id).join("pet.json")) {
                 assert_eq!(parse_manifest(&json).unwrap().house_kind(), kind, "{id}");
@@ -669,6 +669,16 @@ mod tests {
         assert_eq!((m.name.as_str(), m.walk_speed, m.personality, m.size_mult(Stage::Adult), m.hop_share), ("고양이", 60.0, Personality::Aloof, 1.3, 0.5));
         assert_eq!((m.frame_size_at("baby"), m.frame_size_at("kinder"), m.frame_size_at("adult")), (24, 28, 36));
         assert!(m.no_roll() && !m.has_anim("roll"));
+    }
+
+    /// 배로 미끄러지는 동물: 픽셀 pet.json에 roll이 있으면 구른다 (spin은 픽셀 pet.json에 없다 — 돌지 않는다)
+    #[test]
+    fn a_pixel_belly_slide_keeps_its_roll_without_spin() {
+        let base = parse_manifest(&full_json()).unwrap();
+        let json = pixel_json("").replace(r#""animations": {"#, r#""animations": {"roll": {"row": 21, "frames": 2, "fps": 4},"#);
+        let m = parse_pixel_manifest(&json, &base).unwrap();
+        assert!(!m.no_roll() && m.has_anim("roll"));
+        assert_eq!(m.animations["roll"].spin, 0.0);
     }
 
     #[test]
@@ -732,7 +742,12 @@ mod tests {
             let id = path.file_name().unwrap().to_string_lossy().into_owned();
             let base = parse_manifest(&std::fs::read_to_string(ui.join("pets").join(&id).join("pet.json")).unwrap()).unwrap_or_else(|e| panic!("{id}: {e}"));
             let m = parse_pixel_manifest(&json, &base).unwrap_or_else(|e| panic!("{id}: {e}"));
-            assert!(m.no_roll(), "{id} must not carry a roll");
+            // 도는 구르기는 도트로 돌리면 무너진다 — 돌지 않는 배 미끄럼(펭귄·눈사람)만 픽셀에도 있다 (tools/draw_pixel.py PIXEL_ROLL)
+            let slides = matches!(id.as_str(), "penguin" | "snowman");
+            assert_eq!(m.no_roll(), !slides, "{id}: only the belly sliders carry a roll in pixel");
+            if let Some(roll) = m.animations.get("roll") {
+                assert_eq!((roll.spin, base.animations["roll"].spin), (0.0, 0.0), "{id}: a pixel roll never spins");
+            }
             for stage in Stage::ALL {
                 let (name, sheet) = (stage.name(), path.join(format!("sheet_{}.png", stage.name())));
                 if !sheet.is_file() {

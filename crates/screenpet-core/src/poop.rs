@@ -69,12 +69,26 @@ pub fn sanitize_size(sent: Option<f64>) -> f64 {
     }
 }
 
-/// 동물 종류 → 똥 그림: 토끼는 알갱이, 작은 동물은 작은 똥, 나머지는 큰 똥
+/// 동물 종류 → 똥 그림: 토끼는 알갱이, 나머지는 똥 (크기는 몸을 따른다)
 pub fn kind_for(species: &str) -> ObjectKind {
     match species {
         "rabbit" => ObjectKind::Pellets,
-        "frog" | "duck" | "bee" | "ghost" => ObjectKind::Dropping,
         _ => ObjectKind::Poop,
+    }
+}
+
+/// 똥 색 비율: 무지개 10%, 핑크 30%, 나머지 60%는 그 동물의 똥 (토끼는 알갱이)
+pub const RAINBOW_CHANCE: f64 = 0.10;
+pub const PINK_CHANCE: f64 = 0.30;
+
+/// 싼 똥의 종류: roll = 0..1 난수
+pub fn pick_kind(species: &str, roll: f64) -> ObjectKind {
+    if roll < RAINBOW_CHANCE {
+        ObjectKind::Rainbow
+    } else if roll < RAINBOW_CHANCE + PINK_CHANCE {
+        ObjectKind::Pink
+    } else {
+        kind_for(species)
     }
 }
 
@@ -105,15 +119,26 @@ mod tests {
     }
 
     #[test]
+    fn poops_are_sixty_brown_thirty_pink_ten_rainbow() {
+        let mut n = std::collections::HashMap::new();
+        for i in 0..1000 {
+            *n.entry(pick_kind("cat", (i as f64 + 0.5) / 1000.0)).or_insert(0) += 1;
+        }
+        assert_eq!((n[&ObjectKind::Poop], n[&ObjectKind::Pink], n[&ObjectKind::Rainbow]), (600, 300, 100));
+        // 토끼는 갈색 자리에 알갱이
+        assert_eq!(pick_kind("rabbit", 0.99), ObjectKind::Pellets);
+        assert_eq!(pick_kind("rabbit", 0.0), ObjectKind::Rainbow);
+        assert_eq!(pick_kind("rabbit", 0.2), ObjectKind::Pink);
+    }
+
+    #[test]
     fn rabbits_get_pellets_little_pets_a_small_swirl_and_everyone_else_the_big_one() {
         assert_eq!(kind_for("rabbit"), ObjectKind::Pellets);
-        for s in ["frog", "duck", "bee", "ghost"] {
-            assert_eq!(kind_for(s), ObjectKind::Dropping, "{s}");
-        }
-        for s in ["cat", "dog", "bear", "giraffe", "dino_green", "santa", "unknown"] {
+        // 곰·꿀벌·강아지는 v0.5.5에서 빠졌지만 예전 버전 친구가 보낸 똥도 보통 똥이 된다 (모르는 동물과 같다)
+        for s in ["frog", "duck", "bird", "ghost", "cat", "giraffe", "dino_green", "santa", "bear", "bee", "dog", "unknown"] {
             assert_eq!(kind_for(s), ObjectKind::Poop, "{s}");
         }
-        for k in [ObjectKind::Poop, ObjectKind::Dropping, ObjectKind::Pellets] {
+        for k in [ObjectKind::Poop, ObjectKind::Pink, ObjectKind::Rainbow, ObjectKind::Pellets] {
             assert!(k.is_poop());
         }
     }

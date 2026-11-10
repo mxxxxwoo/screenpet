@@ -49,12 +49,13 @@ pub enum ObjectKind {
     Umbrella,
     /// 💩 동물이 싼 똥 (poop.rs): 둘둘 쌓인 큰 똥, 작은 똥, 토끼의 알갱이. 메뉴에 없고 포스트잇을 못 붙인다
     Poop,
-    Dropping,
+    Pink,
+    Rainbow,
     Pellets,
 }
 
 impl ObjectKind {
-    pub const ALL: [ObjectKind; 11] = [
+    pub const ALL: [ObjectKind; 12] = [
         ObjectKind::Can,
         ObjectKind::Paper,
         ObjectKind::Stone,
@@ -64,7 +65,8 @@ impl ObjectKind {
         ObjectKind::Shirt,
         ObjectKind::Umbrella,
         ObjectKind::Poop,
-        ObjectKind::Dropping,
+        ObjectKind::Pink,
+        ObjectKind::Rainbow,
         ObjectKind::Pellets,
     ];
     /// `물건 ▸` 메뉴로 꺼내는 쓰레기
@@ -81,7 +83,7 @@ impl ObjectKind {
 
     /// 똥이다: 수를 따로 세고, 저절로 사라지고, 바람에 구르지 않고, 빗자루에 쓸린다
     pub fn is_poop(self) -> bool {
-        matches!(self, ObjectKind::Poop | ObjectKind::Dropping | ObjectKind::Pellets)
+        matches!(self, ObjectKind::Poop | ObjectKind::Pink | ObjectKind::Rainbow | ObjectKind::Pellets)
     }
 
     /// 그림 크기 배율: 쓰레기는 96 논리 px 칸의 절반 (똥은 싼 동물을 따라 set_scale로 정한다)
@@ -105,7 +107,8 @@ impl ObjectKind {
             ObjectKind::Shirt => "shirt",
             ObjectKind::Umbrella => "umbrella",
             ObjectKind::Poop => "poop",
-            ObjectKind::Dropping => "dropping",
+            ObjectKind::Pink => "pink",
+            ObjectKind::Rainbow => "rainbow",
             ObjectKind::Pellets => "pellets",
         }
     }
@@ -121,19 +124,44 @@ impl ObjectKind {
             ObjectKind::Milk => "🥛 빈 우유팩",
             ObjectKind::Shirt => "👕 누더기 티셔츠",
             ObjectKind::Umbrella => "☂️ 부러진 우산",
-            ObjectKind::Poop | ObjectKind::Dropping | ObjectKind::Pellets => "💩 똥",
+            ObjectKind::Poop | ObjectKind::Pink | ObjectKind::Rainbow | ObjectKind::Pellets => "💩 똥",
         }
     }
 
     /// 아는 이름만 (친구가 보낸 글자 — 그대로 파일 이름·창 스크립트에 쓰이므로 목록과 정확히 같아야 한다)
     pub fn from_id(id: &str) -> Option<ObjectKind> {
+        if id == "dropping" {
+            // 예전의 초록 똥 (옛 버전 친구가 보낸다)
+            return Some(ObjectKind::Poop);
+        }
         ObjectKind::ALL.into_iter().find(|k| k.id() == id || k.wire_id() == id)
+    }
+
+    /// 친구가 던진 이름과 색 표시 → 종류 (색은 똥에만, 모르는 색은 그냥 똥)
+    pub fn wire_kind(id: &str, look: Option<&str>) -> Option<ObjectKind> {
+        match (ObjectKind::from_id(id)?, look) {
+            (ObjectKind::Poop, Some("pink")) => Some(ObjectKind::Pink),
+            (ObjectKind::Poop, Some("rainbow")) => Some(ObjectKind::Rainbow),
+            (kind, _) => Some(kind),
+        }
+    }
+
+    /// 똥 색 (Toss::look으로 보낸다 — 옛 버전 친구는 몰라서 갈색 똥으로 받는다)
+    pub fn look(self) -> Option<&'static str> {
+        match self {
+            ObjectKind::Pink => Some("pink"),
+            ObjectKind::Rainbow => Some("rainbow"),
+            _ => None,
+        }
     }
 
     /// 친구에게 던질 때의 이름: 티셔츠는 양말 자리를 물려받아, 옛 버전 친구는 양말로 받는다
     pub fn wire_id(self) -> &'static str {
+        // 옛 버전 친구는 무지개를 몰라 그냥 똥으로 받는다 (Toss::rainbow로 알린다)
         if self == ObjectKind::Shirt {
             "sock"
+        } else if self.look().is_some() {
+            "poop"
         } else {
             self.id()
         }
@@ -151,7 +179,7 @@ impl ObjectKind {
             ObjectKind::Stone => (8.0, 24.0),
             ObjectKind::Computer => (6.0, 18.0),
             // 바닥에 붙어 있다 (start_gust가 막는다)
-            ObjectKind::Poop | ObjectKind::Dropping | ObjectKind::Pellets => (0.0, 0.0),
+            ObjectKind::Poop | ObjectKind::Pink | ObjectKind::Rainbow | ObjectKind::Pellets => (0.0, 0.0),
         }
     }
 }
@@ -978,8 +1006,8 @@ pub struct TossBudget {
     at: f64,
 }
 
-const TOSS_BURST: f64 = 10.0;
-const TOSS_EVERY_SECS: f64 = 6.0;
+const TOSS_BURST: f64 = 50.0;
+const TOSS_EVERY_SECS: f64 = 1.2;
 
 impl Default for TossBudget {
     fn default() -> Self {
@@ -1004,6 +1032,8 @@ impl TossBudget {
 
 /// 메뉴 한 번에 던지는 물건 수
 const VOLLEY_SIZE: u32 = 10;
+/// 연달아 눌러 쌓을 수 있는 횟수
+const MAX_VOLLEYS: u32 = 5;
 
 /// 친구 한 명에게 "물건 10개 던지기"로 기다리는 수: 다시 눌러도 10개까지만 기다린다
 #[derive(Debug, Default, Clone, Copy)]
@@ -1012,8 +1042,9 @@ pub struct Volley {
 }
 
 impl Volley {
+    /// 누를 때마다 10개씩, 다섯 번까지 쌓인다
     pub fn request(&mut self) {
-        self.left = VOLLEY_SIZE;
+        self.left = (self.left + VOLLEY_SIZE).min(VOLLEY_SIZE * MAX_VOLLEYS);
     }
 
     /// 예산이 되는 만큼 예산을 쓰고, 지금 던질 수를 돌려준다

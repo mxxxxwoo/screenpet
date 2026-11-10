@@ -10,6 +10,7 @@ use screenpet_core::config::{self, Config};
 use screenpet_core::broom::Broom;
 use screenpet_core::food::{self, FeedMode, HandFeed, HandInput};
 use screenpet_core::geom::Rect;
+use screenpet_core::linked;
 use screenpet_core::manifest::FavoriteFood;
 use screenpet_core::style::PetStyle;
 use screenpet_core::pacing::Pacer;
@@ -20,7 +21,6 @@ use screenpet_core::visit::Side;
 use screenpet_core::world::World;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::decal::Decals;
 use crate::gifts::Gifts;
 use crate::house::{self, HouseState};
 use crate::network::{NetInput, Network};
@@ -29,6 +29,7 @@ use crate::pets::PetEntry;
 use crate::presence::Presence;
 use crate::prop::{HandWindow, Props};
 use crate::slots::{self, GuestInfo, Role, Slot, OWN_LABEL};
+use crate::timeline::TimelineFx;
 use crate::weather::WeatherFx;
 use crate::AppState;
 
@@ -52,8 +53,9 @@ const NO_PIXEL_ART_HINT: &str = "픽셀 그림 준비 중!";
 pub enum Input {
     /// 창(label)의 동물을 눌렀다
     PointerDown { label: String },
-    /// 동물 교체 — 돌보기 상태는 게임 루프가 가진 설정에서 찾는다
-    SetPet { entry: PetEntry },
+    /// 동물 교체 — 돌보기 상태는 게임 루프가 가진 설정에서 찾는다.
+    /// remote = 📱 노는 내 다른 컴퓨터가 바꿨다 (다시 알리지 않고, 트레이 체크를 맞춘다)
+    SetPet { entry: PetEntry, remote: bool },
     /// 캐릭터 스타일 (동글동글 / 픽셀, 설정에 남는다) — 바로 그림이 바뀐다
     SetStyle(PetStyle),
     Feed(Food),
@@ -97,10 +99,16 @@ pub enum Input {
     ShowHelp,
     /// 메뉴 "🎁 선물 도감" (창 만들기는 게임 루프 스레드에서)
     ShowGiftBook,
+    /// 메뉴 "💩 똥피하기"
+    ShowDodge,
+    /// 똥피하기 창에서
+    Dodge(crate::dodge::DodgeInput),
     /// 📏 크기 조절 창을 연다
     ShowSizes,
     /// 크기 조절 창의 값 (%). save = 슬라이더를 놓았다: 파일에 남긴다
     SetSizes { pet: u32, object: u32, save: bool },
+    /// 메뉴 "🕐 최근 한 시간" (기록은 게임 루프가 가진다)
+    ShowTimeline,
     /// 저장하고 앱 종료
     Quit,
     /// 앱이 끝나는 중 (창이 닫힘·로그오프 등): 저장만 하고 알린 뒤 루프를 끝낸다
@@ -120,6 +128,11 @@ pub fn spawn(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Confi
             handle.exit(1);
         }
     });
+}
+
+/// 📱 내 펫·돌보기 상태가 바뀌었다: 내 다른 컴퓨터와 나눈다 (edit = 사용자가 바꿈 — 쉬는 중이면 이 컴퓨터로 논다)
+fn share_care(network: &Network, config: &Config, own: &Slot, care: &Care, edit: bool) {
+    network.share_state(config, &own.entry.id, care, edit);
 }
 
 /// 설정 저장 — 게임 루프만 설정을 쓴다 (단일 작성자). 하우스 여부는 config.housed에 직접 적어 둔다
@@ -147,7 +160,7 @@ fn sync_growth(app: &AppHandle, care: &Care) {
 }
 
 /// 지금 내 동물의 말풍선·음식 고르기를 띄울 창: 하우스 안이면 하우스 창, 아니면 펫 창
-fn speech_target(pet: &Pet) -> &'static str {
+pub(crate) fn speech_target(pet: &Pet) -> &'static str {
     if pet.is_housed() {
         house::LABEL
     } else {
@@ -279,6 +292,7 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
     if new_id {
         save_config(&app, &mut config, &slots[OWN].entry.id, &care);
     }
+    share_care(&network, &config, &slots[OWN], &care, false);
     // 내 동물이 친구 화면에 가 있거나 가는 중 (하우스·동물 바꾸기 메뉴를 막는다)
     let mut was_busy = false;
 
@@ -289,9 +303,7 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
     let mut last_save = last;
     // 먹고 한 단계 컸지만 아직 먹는 중 — 먹기가 끝나면(축하 시작 또는 중단) 크기를 바꾼다
     let mut pending_stage = false;
-    // 꿀벌이 쏜 침 자국 창들
-    let mut decals = Decals::default();
-    // 내 동물이 먹을 때 앞에 놓이는 밥그릇·물그릇·꽃·쿠키 창
+    // 내 동물이 먹을 때 앞에 놓이는 밥그릇·물그릇·쿠키 창
     let mut props = Props::default();
     // 직접 주기: 커서 끝에 붙은 음식과 그 그림 창
     let mut hand: Option<HandFeed> = None;
@@ -307,7 +319,11 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
     let mut presence = Presence::new(&app, config.focus_length);
     // 물건 (쓰레기 장난감 — 없거나 잠들어 있으면 일이 없다)
     let mut objects = Objects::new();
+    let mut dodge = crate::dodge::DodgeFx::new();
+    let mut sleigh = crate::sleigh::SleighFx::new();
     objects.set_size(&app, config.object_size());
+    // 🕐 최근 한 시간 (메모리에만)
+    let mut timeline = TimelineFx::new();
     // 💩 왼쪽 버튼을 새로 누른 순간만 쓴다 (어디를 무엇을 눌렀는지는 보지도 남기지도 않는다)
     let mut was_left_down = false;
     let mut poop_spots = Vec::new();
@@ -333,9 +349,10 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                     if let Some(i) = slots::find(&slots, &label) {
                         let (cx, cy) = source.cursor();
                         slots[i].pet.pointer_down(cx, cy);
+                        slots[i].start_glow();
                     }
                 }
-                Input::SetPet { entry: next } => {
+                Input::SetPet { entry: next, remote } => {
                     let own = &mut slots[OWN];
                     // 친구 화면에 가 있거나 가는 중엔 바꾸지 않는다 (트레이 체크만 되돌린다)
                     if network.own_busy(own) {
@@ -365,6 +382,12 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                     sync_menu(&app, &own.entry, &care, config.housed);
                     save_config(&app, &mut config, &own.entry.id, &care);
                     hint_no_pixel_art(&app, own);
+                    if !remote {
+                        share_care(&network, &config, own, &care, true);
+                    } else {
+                        // 📱 저쪽에서 바꿨다: 트레이 체크도 맞춘다 (누른 항목만 스스로 뒤집힌다)
+                        crate::tray::sync_pet_checks(&app.state::<AppState>().menu, &own.entry.id);
+                    }
                 }
                 Input::SetStyle(style) => {
                     // 체크 항목은 누를 때 스스로 뒤집히므로 항상 다시 맞춘다
@@ -412,10 +435,12 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                     let before = care.clone();
                     let result = care.feed(food);
                     if own.pet.feed_result(result, food) {
-                        if let FeedResult::Ate { leveled_up: true } = result {
-                            pending_stage = true;
+                        if let FeedResult::Ate { leveled_up } = result {
+                            pending_stage |= leveled_up;
+                            timeline.ate(&app, food, &favorite_of(&own.entry), &config);
                         }
                         save_config(&app, &mut config, &own.entry.id, &care);
+                        share_care(&network, &config, own, &care, true);
                     } else {
                         // 공중·드래그·놀러 가는 중이라 못 먹었다 — 먹지 않은 것으로 되돌린다
                         care = before;
@@ -433,6 +458,7 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                     // 체크 항목은 누를 때 스스로 뒤집히므로 항상 실제 값으로 다시 맞춘다
                     sync_menu(&app, &slots[OWN].entry, &care, config.housed);
                     save_config(&app, &mut config, &slots[OWN].entry.id, &care);
+                    share_care(&network, &config, &slots[OWN], &care, true);
                 }
                 Input::ResetGrowth => {
                     let own = &mut slots[OWN];
@@ -441,6 +467,7 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                     apply_own_stage(&app, own, &care);
                     own.pet.set_hungry(care.is_hungry());
                     save_config(&app, &mut config, &own.entry.id, &care);
+                    share_care(&network, &config, own, &care, true);
                 }
                 Input::ToggleHouse => {
                     let own = &mut slots[OWN];
@@ -465,6 +492,10 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                     }
                     sync_menu(&app, &own.entry, &care, config.housed);
                     save_config(&app, &mut config, &own.entry.id, &care);
+                }
+                // 똥피하기 창이 열려 있으면 조작 모드는 켜지 않는다 (게임이 키를 준다)
+                Input::ToggleControl if dodge.is_open() => {
+                    let _ = app.state::<AppState>().menu.control.set_checked(false);
                 }
                 Input::ToggleControl => {
                     control_on = !control_on;
@@ -611,6 +642,37 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                         screenpet_core::visit::TossAnswer::Drop => {}
                     }
                 }
+                // 📱 노는 내 다른 컴퓨터의 펫과 성장 (net이 그 컴퓨터가 놀 때만, 모양을 확인해 넘긴다):
+                // 아는 동물만 다듬어 합치고 (보내지 않은 동물은 그대로), 화면의 내 펫·단계·배고픔도 바로 맞춘다. 다시 보내지 않는다
+                Input::Net(NetInput::Event(screenpet_net::NetEvent::DeviceState { from, pet, care: shared })) => {
+                    if config.linked_device().map(|(id, _)| id) != Some(from.as_str()) {
+                        continue;
+                    }
+                    let state = app.state::<AppState>();
+                    let known = |p: &str| state.pets.iter().any(|e| e.id == p);
+                    let list: Vec<linked::SharedCare> = shared
+                        .into_iter()
+                        .map(|c| linked::SharedCare { pet: c.pet, stage: c.stage, stamina: c.stamina, fullness: c.fullness, locked: c.locked })
+                        .collect();
+                    let own = &mut slots[OWN];
+                    config.care.insert(own.entry.id.clone(), care.clone());
+                    let got = linked::adopt_shared(&mut config.care, &own.entry.id, pet.as_deref(), &list, known);
+                    if got.changed {
+                        let shown = care.stage;
+                        care = config.care.get(&own.entry.id).cloned().unwrap_or_default();
+                        if care.stage != shown || pending_stage {
+                            pending_stage = false;
+                            apply_own_stage(&app, own, &care);
+                        }
+                        own.pet.set_hungry(care.is_hungry());
+                        sync_menu(&app, &own.entry, &care, config.housed);
+                        save_config(&app, &mut config, &own.entry.id, &care);
+                    }
+                    // 펫 바꾸기는 평소 길로 (친구에게 가 있으면 다음 소식 때 다시)
+                    if let Some(entry) = got.switch_to.and_then(|id| state.pets.iter().find(|e| e.id == id).cloned()) {
+                        state.send(Input::SetPet { entry, remote: true });
+                    }
+                }
                 Input::Net(input) => {
                     if network.handle(&app, input, &mut config, &mut slots) {
                         save_config(&app, &mut config, &slots[OWN].entry.id, &care);
@@ -618,6 +680,16 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                 }
                 Input::ShowHelp => crate::help::show(&app),
                 Input::ShowGiftBook => crate::gifts::show_book(&app),
+                Input::ShowDodge => {
+                    // 조작 모드는 게임이 대신한다
+                    if control_on {
+                        control_on = false;
+                        slots[OWN].pet.set_control(false);
+                        let _ = app.state::<AppState>().menu.control.set_checked(false);
+                    }
+                    dodge.open(&app, &slots[OWN], &config);
+                }
+                Input::Dodge(d) => dodge.handle(&app, d, &mut slots[OWN], &config),
                 Input::ShowSizes => crate::sizes::show(&app, &config),
                 Input::SetSizes { pet, object, save } => {
                     config.set_sizes(pet, object);
@@ -633,6 +705,7 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                         save_config(&app, &mut config, &slots[OWN].entry.id, &care);
                     }
                 }
+                Input::ShowTimeline => timeline.show(&app, &config),
                 Input::Quit => {
                     save_config(&app, &mut config, &slots[OWN].entry.id, &care);
                     app.exit(0);
@@ -647,7 +720,9 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
         }
 
         let now = Instant::now();
-        let dt = (now - last).as_secs_f64().min(MAX_DT);
+        // 타임라인은 실제로 흐른 시간을 쓴다 (컴퓨터가 잤으면 그 시간도 지금 자리에 더한다)
+        let real_dt = (now - last).as_secs_f64();
+        let dt = real_dt.min(MAX_DT);
         last = now;
         care.tick(dt);
         if now - last_refresh >= WORLD_REFRESH {
@@ -663,6 +738,8 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
         }
         if now - last_save >= SAVE_EVERY {
             save_config(&app, &mut config, &slots[OWN].entry.id, &care);
+            // 📱 노는 동안 가끔 지금 포만감까지 (쉬는 컴퓨터도 같은 시간만큼 배고파진다)
+            share_care(&network, &config, &slots[OWN], &care, false);
             last_save = now;
         }
 
@@ -686,9 +763,11 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                 if own.pet.eat_from_hand(result, food) {
                     if let FeedResult::Ate { leveled_up } = result {
                         pending_stage |= leveled_up;
+                        timeline.ate(&app, food, &favorite_of(&own.entry), &config);
                         hand_win.bite();
                         done = true;
                         save_config(&app, &mut config, &own.entry.id, &care);
+                        share_care(&network, &config, own, &care, true);
                     }
                     // 배불러 갸웃 — 음식은 손에 남는다
                 } else {
@@ -734,6 +813,8 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
         }
         // 🎮 조작 모드: 키를 내 동물에게 (친구 화면에 가 있으면 친구 링크로도). Esc(직접 주기 중이 아닐 때)·키 없이 3분이면 끝
         let mut keys = ControlInput::default();
+        // 💩 똥피하기: 게임 창이 받은 키를 내 동물에게
+        dodge.steer(&mut slots[OWN], dt);
         if control_on {
             keys = source.control_keys();
             saw_key |= keys.any();
@@ -776,7 +857,7 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                         crate::slots::Role::Guest(g) => Some(g.owner_name.as_str()),
                         crate::slots::Role::Own => None,
                     };
-                    objects.drop_poop(screenpet_core::poop::kind_for(&s.entry.id), x, y, screenpet_core::poop::size_for(s.shown.scale), guest_owner);
+                    objects.drop_poop(screenpet_core::poop::pick_kind(&s.entry.id, fastrand::f64()), x, y, screenpet_core::poop::size_for(s.shown.scale), guest_owner);
                 }
             }
         }
@@ -800,12 +881,17 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
         objects.hit_pets(&mut social, dt, &mut slots);
         // 연결된 친구가 있는 끝으로만 나간다
         network.set_exit_edges(&config, &mut slots);
+        // 똥피하기 창이 열려 있는 동안엔 화면 끝으로 나가지 않는다
+        if dodge.is_open() {
+            slots[OWN].pet.set_exit_edges(false, false);
+            slots[OWN].pet.set_vertical_edges(false, false);
+        }
         let mut own_exit = None;
         let mut left = Vec::new();
         objects.poop_spots(&mut poop_spots);
         for (i, s) in slots.iter_mut().enumerate() {
-            // 친구 화면에 가 있는 동안엔 물리·행동이 멈춘다
-            if !s.pet.is_away() {
+            // 친구 화면에 가 있거나 🛷 썰매에 탄 동안엔 물리·행동이 멈춘다
+            if !s.pet.is_away() && !sleigh.is_riding(&s.label) {
                 s.pet.notice_poops(&poop_spots, &s.world);
                 s.pet.update(dt, &s.world);
             }
@@ -813,11 +899,7 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
                 let target = if s.is_own() { speech_target(&s.pet) } else { s.label.as_str() };
                 let _ = app.emit_to(target, "pet-say", speech);
             }
-            // 꿀벌이 화면을 쐈다 — 그 자리에 침 자국
-            if let Some((x, y)) = s.pet.take_sting() {
-                decals.spawn(&app, x, y, s.dpi);
-            }
-            // 밥그릇·꽃 놓기·거두기 (손님은 먹이를 받지 않는다)
+            // 밥그릇 놓기·거두기 (손님은 먹이를 받지 않는다)
             if let Some(ev) = s.pet.take_prop() {
                 if s.is_own() {
                     props.apply(&app, ev, s.dpi, s.shown.scale, s.pixel_dot());
@@ -840,7 +922,7 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
             let fling = slot.pet.take_fling();
             if let Role::Guest(g) = &slot.role {
                 eprintln!("guest {} ({}) left", g.visit_id, g.owner_id);
-                network.guest_left(&config, g, side, slot.pet.guest(), fling, slot.boost);
+                network.guest_left(&config, &slot, g, side, slot.pet.guest(), fling);
             }
             slots::close(&app, slot);
         }
@@ -851,8 +933,11 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
             network.own_exited(&config, &mut slots[OWN], side);
         }
         network.tick(&app, now, &config, &mut slots[OWN]);
+        timeline.tick(&app, real_dt, &slots[OWN], network.away_friend(), &config);
+        if dodge.tick(&app, dt, &mut slots[OWN], &mut config, &network) {
+            save_config(&app, &mut config, &slots[OWN].entry.id, &care);
+        }
         objects.tick(&app, &slots[OWN].world, dt, now, (cx, cy), left_down, presence.is_away(), source.as_mut(), &network, &config);
-        decals.tick(now);
         props.tick(now);
         hand_win.tick(now);
         broom_win.tick(now);
@@ -864,6 +949,11 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
         gifts.tick(&app, now, dt, &slots, &care);
         if presence.tick(&app, now, source.as_mut(), &mut slots[OWN], &mut care, &mut config.daily) {
             save_config(&app, &mut config, &slots[OWN].entry.id, &care);
+            share_care(&network, &config, &slots[OWN], &care, false);
+        }
+        // 📱 대기 중인 이 컴퓨터를 다시 쓰기 시작했으면 이 컴퓨터로 논다 (쓴 지 얼마나 됐는지는 net에도)
+        if let Some((secs, idle)) = presence.take_sample() {
+            network.tick_presence(secs, idle);
         }
         // 손님도 이 화면 주인이 자리를 비운 동안엔 잠만 잔다
         for s in &mut slots[OWN + 1..] {
@@ -934,7 +1024,12 @@ fn run(app: AppHandle, rx: Receiver<Input>, entry: PetEntry, config: Config) {
         }
 
         let hidden = crate::windows_hidden(&app);
+        // 🛷 루돌프와 산타가 만나면 썰매로 한 바퀴 (탄 동안 둘의 창은 치워 둔다)
+        sleigh.tick(&app, dt, &mut slots, hidden || dodge.is_open());
         for s in &mut slots {
+            if sleigh.is_riding(&s.label) {
+                continue;
+            }
             s.place(hidden);
             if let Some(render) = s.take_render(&app) {
                 let _ = app.emit_to(s.label.as_str(), "pet-render", render);

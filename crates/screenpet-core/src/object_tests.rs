@@ -515,18 +515,18 @@ fn roster_keeps_ten_own_and_twenty_foreign_dropping_the_oldest() {
 }
 
 #[test]
-fn toss_budget_allows_ten_a_minute_per_link() {
+fn toss_budget_allows_fifty_at_once_then_fifty_a_minute() {
     let mut b = TossBudget::default();
-    for _ in 0..10 {
+    for _ in 0..50 {
         assert!(b.can_spend(0.0));
         b.spend(0.0);
     }
     assert!(!b.can_spend(0.0));
-    assert!(!b.can_spend(5.0));
-    assert!(b.can_spend(6.0));
-    b.spend(6.0);
-    assert!(!b.can_spend(6.0));
-    assert!(b.can_spend(66.0));
+    assert!(!b.can_spend(1.0));
+    assert!(b.can_spend(1.2));
+    b.spend(1.2);
+    assert!(!b.can_spend(1.2));
+    assert!(b.can_spend(61.2));
 }
 
 #[test]
@@ -976,7 +976,7 @@ fn thrown_down_it_falls_past_window_tops_to_the_friend_below() {
 
 // ---- 💩 똥 ----
 
-const POOPS: [ObjectKind; 3] = [ObjectKind::Poop, ObjectKind::Dropping, ObjectKind::Pellets];
+const POOPS: [ObjectKind; 4] = [ObjectKind::Poop, ObjectKind::Pink, ObjectKind::Rainbow, ObjectKind::Pellets];
 
 fn poop_on_floor(kind: ObjectKind) -> (Object, World) {
     let w = floor();
@@ -1175,37 +1175,43 @@ fn volley_sends_ten_at_once_on_a_full_budget() {
     v.request();
     assert_eq!(v.release(&mut b, 0.0), 10);
     assert!(v.is_done());
+    // 손으로 던지는 것과 같은 예산을 쓴다: 남은 건 40개
+    for _ in 0..40 {
+        assert!(b.can_spend(0.0));
+        b.spend(0.0);
+    }
     assert!(!b.can_spend(0.0), "the volley spends the same budget as a hand throw");
 }
 
 #[test]
 fn volley_over_the_budget_waits_for_its_turn() {
     let mut b = TossBudget::default();
-    for _ in 0..7 {
+    for _ in 0..47 {
         b.spend(0.0);
     }
     let mut v = Volley::default();
     v.request();
     assert_eq!(v.release(&mut b, 0.0), 3);
-    assert_eq!(v.release(&mut b, 5.0), 0);
-    assert_eq!(v.release(&mut b, 6.0), 1);
+    assert_eq!(v.release(&mut b, 1.0), 0);
+    assert_eq!(v.release(&mut b, 1.2), 1);
     assert!(!v.is_done());
     assert_eq!(v.release(&mut b, 1000.0), 6);
     assert!(v.is_done());
 }
 
 #[test]
-fn volley_requests_do_not_pile_up() {
+fn up_to_five_volleys_pile_up_and_no_more() {
     let mut b = TossBudget::default();
-    for _ in 0..10 {
-        b.spend(0.0);
-    }
     let mut v = Volley::default();
     for _ in 0..50 {
         v.request();
     }
-    assert_eq!(v.release(&mut b, 1000.0), 10);
+    assert_eq!(v.release(&mut b, 0.0), 50, "five volleys go out at once on a full budget");
     assert!(v.is_done());
+    for _ in 0..50 {
+        v.request();
+    }
+    assert_eq!(v.release(&mut b, 1000.0), 50);
 }
 
 #[test]
@@ -1303,8 +1309,8 @@ fn the_shirt_still_travels_as_sock_so_older_friends_can_catch_it() {
     assert_eq!(ObjectKind::from_id("sock"), Some(ObjectKind::Shirt));
     assert_eq!(ObjectKind::from_id("shirt"), Some(ObjectKind::Shirt));
     for k in ObjectKind::ALL {
-        assert_eq!(ObjectKind::from_id(k.wire_id()), Some(k));
-        if k != ObjectKind::Shirt {
+        assert_eq!(ObjectKind::wire_kind(k.wire_id(), k.look()), Some(k));
+        if k != ObjectKind::Shirt && k.look().is_none() {
             assert_eq!(k.wire_id(), k.id());
         }
     }
@@ -1340,4 +1346,33 @@ fn a_sender_tag_needs_a_name_and_stays_short() {
     assert_eq!(tag, format!("🎯 {}…", "가".repeat(SENDER_TAG_CHARS)));
     let exact = "나".repeat(SENDER_TAG_CHARS);
     assert!(!sender_tag(Arrival::Thrown, &exact).unwrap().ends_with('…'));
+}
+
+#[test]
+fn rainbow_poop_travels_as_poop_and_the_green_one_is_gone() {
+    assert!(ObjectKind::Rainbow.is_poop());
+    assert_eq!(ObjectKind::Rainbow.id(), "rainbow");
+    assert_eq!(ObjectKind::Rainbow.wire_id(), "poop", "older friends get a plain poop");
+    assert_eq!(ObjectKind::from_id("rainbow"), Some(ObjectKind::Rainbow));
+    // 옛 친구가 보낸 초록 똥은 그냥 똥이 된다
+    assert_eq!(ObjectKind::from_id("dropping"), Some(ObjectKind::Poop));
+    assert!(ObjectKind::ALL.iter().all(|k| k.id() != "dropping"));
+    assert_eq!(ObjectKind::wire_kind(ObjectKind::Rainbow.wire_id(), Some("rainbow")), Some(ObjectKind::Rainbow));
+    assert_eq!(ObjectKind::wire_kind("poop", None), Some(ObjectKind::Poop));
+    // 똥이 아닌 것에 붙은 색 표시, 모르는 색은 무시한다
+    assert_eq!(ObjectKind::wire_kind("can", Some("rainbow")), Some(ObjectKind::Can));
+    assert_eq!(ObjectKind::wire_kind("poop", Some("plaid")), Some(ObjectKind::Poop));
+}
+
+#[test]
+fn pink_poop_travels_as_poop_with_its_colour() {
+    assert!(ObjectKind::Pink.is_poop());
+    assert_eq!(ObjectKind::Pink.id(), "pink");
+    assert_eq!(ObjectKind::Pink.wire_id(), "poop", "older friends get a plain poop");
+    assert_eq!(ObjectKind::Pink.look(), Some("pink"));
+    assert_eq!(ObjectKind::Rainbow.look(), Some("rainbow"));
+    assert_eq!(ObjectKind::Poop.look(), None);
+    for k in ObjectKind::ALL {
+        assert_eq!(ObjectKind::wire_kind(k.wire_id(), k.look()), Some(k), "{k:?}");
+    }
 }

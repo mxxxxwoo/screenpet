@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod art;
-mod decal;
+mod dodge;
 mod game_loop;
 mod gifts;
 mod help;
@@ -14,7 +14,9 @@ mod pets;
 mod presence;
 mod prop;
 mod sizes;
+mod sleigh;
 mod slots;
+mod timeline;
 mod tray;
 mod weather;
 
@@ -36,8 +38,6 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 /// 설정이 없을 때 처음 데려오는 동물
 const DEFAULT_PET: &str = "cat";
-/// 없어진 동물 → 대신 데려올 동물 (저장된 선택과 돌보기 상태를 옮긴다)
-const RENAMED_PETS: [(&str, &str); 1] = [("beaver", "bear")];
 
 pub struct AppState {
     pub tx: Mutex<Sender<Input>>,
@@ -184,7 +184,7 @@ fn pair_answer(window: WebviewWindow, state: State<AppState>, accept: bool) {
 pub fn select_pet(app: &AppHandle, id: &str) {
     let state = app.state::<AppState>();
     let Some(entry) = state.pets.iter().find(|p| p.id == id) else { return };
-    state.send(Input::SetPet { entry: entry.clone() });
+    state.send(Input::SetPet { entry: entry.clone(), remote: false });
 }
 
 /// 패닉을 config 폴더의 `crash.log`에 남긴다 (배포판은 콘솔이 없어 그냥 사라진다)
@@ -231,10 +231,8 @@ fn main() {
                 overlay::float_everywhere(&window);
             }
             let config_dir = app.path().app_config_dir()?;
-            let mut cfg = config::load(&config_dir);
-            for (from, to) in RENAMED_PETS {
-                cfg.rename_pet(from, to);
-            }
+            // 이름이 바뀌었거나 없어진 동물(곰·꿀벌·강아지 → 고양이)은 load가 옮긴다 (Config::retire_pets)
+            let cfg = config::load(&config_dir);
             let fallback = if pets.iter().any(|p| p.id == DEFAULT_PET) { DEFAULT_PET.to_string() } else { pets[0].id.clone() };
             let current = cfg.pet.clone().filter(|id| pets.iter().any(|p| &p.id == id)).unwrap_or(fallback);
             let entry = pets.iter().find(|p| p.id == current).unwrap().clone();
@@ -289,6 +287,10 @@ fn main() {
             network::name_state,
             network::name_submit,
             network::name_close,
+            network::link_state,
+            network::link_submit,
+            network::link_close,
+            network::link_confirm,
             sizes::size_state,
             sizes::size_set,
             sizes::size_close,
@@ -303,6 +305,12 @@ fn main() {
             ladder::ladder_seen,
             gifts::gift_collect,
             gifts::book_state,
+            timeline::timeline_state,
+            timeline::timeline_fit,
+            dodge::dodge_state,
+            dodge::dodge_keys,
+            dodge::dodge_start,
+            dodge::dodge_close,
             objects::object_down,
             objects::object_hover,
             objects::object_menu,

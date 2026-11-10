@@ -376,6 +376,7 @@ fn auto_dial(shared: &Arc<Shared>, client: &Arc<RelayClient>) {
                 continue;
             }
             if st.dialing.contains(&f.id)
+                || st.standby_blocks(&f.id)
                 || st.backed_off(&Backoff::Id(f.id.clone()), now)
                 || inner.retry.get(&f.id).is_some_and(|(until, _)| now < *until)
             {
@@ -669,7 +670,7 @@ fn serve(shared: &Arc<Shared>, client: &Arc<RelayClient>, mut ws: Ws) -> bool {
         eprintln!("screenpet relay {}: unexpected relay key {relay}; refusing", client.url);
         return false;
     }
-    let own_pub = noise::public_key(&shared.static_key);
+    let own_pub = shared.public_key;
     let shared_secret = curve25519_dalek::MontgomeryPoint(relay_pub).mul_clamped(shared.static_key).to_bytes();
     if shared_secret.iter().all(|b| *b == 0) {
         return false;
@@ -862,7 +863,11 @@ fn on_message(shared: &Arc<Shared>, client: &Arc<RelayClient>, gen: u64, m: Serv
             if id.is_empty() || id.len() > MAX_ID || id == shared.id {
                 return fail("unknown");
             }
-            if shared.state().is_friend(&id) {
+            let known = {
+                let st = shared.state();
+                st.is_friend(&id) && !st.introduced_only(&id)
+            };
+            if known {
                 return fail("already_friend");
             }
             if peers::invite_at(shared, &id, &pet, Candidate::Relay(key)) {

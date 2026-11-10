@@ -6,7 +6,6 @@ use crate::care::{FeedResult, Food};
 use crate::flight::Flight;
 use crate::food::{self, Prop, PropEvent};
 use crate::geom::Rect;
-use crate::sting::{ClickMeter, PathMeter, StingPhase};
 use crate::inside::{self, Mode, Stay};
 use crate::behavior::{self, ClickOutcome, ClickReaction, Family, Move, Personality, Rest, Special, Trick};
 use crate::physics::{step_air, throw_velocity, Body, GRAVITY, THROW_GRAVITY_LOGICAL, THROW_LIFT, VELOCITY_WINDOW};
@@ -99,7 +98,6 @@ pub enum Anim {
     Tickle,
     Annoyed,
     Arch,
-    Wag,
     Hungry,
     Eat,
     LevelUp,
@@ -109,8 +107,6 @@ pub enum Anim {
     Climb,
     /// 벽 타기 — 미끄러져 내려오기 (뒷모습)
     Slide,
-    /// 꿀벌 쏘기 — "!" 하고 화면 쪽으로 돌진 (앞모습)
-    Sting,
     /// 개구리 큰 점프 — 깊게 웅크렸다가 쭉 뻗어 날아오른다 (옆모습, brain_hop.rs)
     #[serde(rename = "bigjump")]
     BigJump,
@@ -126,6 +122,8 @@ pub enum Anim {
     Roar,
     /// 공룡 제자리 쿵쾅쿵쾅 (옆모습) — 앱은 몸을 살짝 떨고, 같은 바닥의 친구들이 흔들린다 (brain_stomp.rs)
     Stomp,
+    /// 레서판다 깜짝 — 뒷발로 벌떡 서서 두 팔을 번쩍 (앞모습, 한 번)
+    Surprise,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -140,8 +138,6 @@ pub enum Speech {
     LevelUp,
     /// 클릭 무시 ("...")
     Ignore,
-    /// 꿀벌이 화면을 쏨 ("콕!")
-    Sting,
     /// 배고플 때 손에 든 음식을 봤다 ("냠!?")
     Eager,
     /// 다른 동물에게 인사 ("hi!", brain_social.rs)
@@ -200,6 +196,10 @@ pub enum Speech {
     Ting,
     /// 날아온 것에 살짝 맞음 ("ow!", brain_hit.rs)
     Ow,
+    /// 빠른 새가 친구 화면으로 쌩 날아 나가거나 들어옴 ("whoosh!", brain_fly.rs)
+    Whoosh,
+    /// 깜짝 놀라 벌떡 ("!!", 레서판다 Special::Surprise)
+    Surprise,
 }
 
 impl Anim {
@@ -210,7 +210,7 @@ impl Anim {
 
     /// 앞모습 동작 — 좌우 반전하지 않는다.
     pub fn is_front(self) -> bool {
-        matches!(self, Anim::SitFront | Anim::Wave | Anim::Tilt | Anim::Belly | Anim::Stretch | Anim::Heart | Anim::Tickle | Anim::Wag | Anim::Hungry | Anim::Eat | Anim::LevelUp | Anim::Huff | Anim::Sting)
+        matches!(self, Anim::SitFront | Anim::Wave | Anim::Tilt | Anim::Belly | Anim::Stretch | Anim::Heart | Anim::Tickle | Anim::Hungry | Anim::Eat | Anim::LevelUp | Anim::Huff | Anim::Surprise)
     }
 }
 
@@ -228,11 +228,11 @@ impl From<Special> for Anim {
     fn from(s: Special) -> Self {
         match s {
             Special::Arch => Anim::Arch,
-            Special::Wag => Anim::Wag,
             Special::NeckStretch => Anim::NeckStretch,
             Special::Fire => Anim::Fire,
             Special::Roar => Anim::Roar,
             Special::Stomp => Anim::Stomp,
+            Special::Surprise => Anim::Surprise,
         }
     }
 }
@@ -299,8 +299,6 @@ pub enum State {
     Away,
     /// 창 안쪽 벽을 기어올라 윗면으로 나가는 중 (spec 2B §9). rel_x = 몸 중심 − 창 왼쪽, rel_y = 발 높이 − 창 윗면
     InnerClimb { window: u64, rel_x: f64, rel_y: f64 },
-    /// 꿀벌이 괴롭힘에 화나 화면을 쏘는 중 (spec 2B §10) — 제자리에서 "!" → 돌진 → 콕! → 흥!
-    Sting { phase: StingPhase, remaining: f64 },
     /// 먹이를 받아 그릇(나는 동물은 꽃)으로 가는 중 — remaining초 안에 못 닿으면 그 자리에서 먹는다
     ToFood { remaining: f64 },
     /// 손에 든 음식(직접 주기)을 보고 기다리는 중 — 같은 바닥 가까이면 걸어가고, 나는 동물은 날아간다
@@ -350,8 +348,7 @@ impl State {
             | State::Tickled { .. }
             | State::Hungry { .. }
             | State::Eating { .. }
-            | State::LevelUp { .. }
-            | State::Sting { .. } => {
+            | State::LevelUp { .. } => {
                 Some(Family::Front)
             }
             State::Special { .. } => Some(Family::Special),
@@ -430,12 +427,12 @@ pub struct PetConfig {
     pub special: Option<Special>,
     /// 성격 (pet.json `personality`)
     pub personality: Personality,
-    /// 벽 타기 (pet.json에 climb·slide가 있는 고양이·곰)
+    /// 벽 타기 (pet.json에 climb·slide가 있는 고양이 등)
     pub can_climb: bool,
-    /// 날아다닌다 (pet.json `locomotion: fly` — 꿀벌, spec 2B §10)
+    /// 날아다닌다 (pet.json `locomotion: fly` — 유령·새, spec 2B §10)
     pub flies: bool,
-    /// 괴롭히면 화면을 쏜다 (pet.json에 sting이 있는 꿀벌)
-    pub stings: bool,
+    /// 빠른 나는 동물 (pet.json `swift` — 새): 더 자주 내려앉고, 친구 화면으로는 멀리서부터 "whoosh!" 쌩 (brain_fly.rs)
+    pub swift: bool,
     /// 폴짝폴짝 뛰어다닌다 (pet.json `locomotion: hop` — 개구리, brain_hop.rs)
     pub hops: bool,
     /// 걷기·달리기 토막 중 깡총거리는 몫 (pet.json `hop_share` — 토끼 0.5, brain_hop.rs). 개구리(hops)는 늘 폴짝
@@ -470,7 +467,7 @@ impl PetConfig {
             personality: m.personality,
             can_climb: m.can_climb(),
             flies: m.flies(),
-            stings: m.can_sting(),
+            swift: m.flies() && m.swift,
             hops: m.hops(),
             hop_share: m.hop_share(),
             looks_up: m.can_look_up(),
@@ -582,14 +579,6 @@ pub struct Pet {
     above_since: Option<f64>,
     /// 디딤판에 놓인 소품 (소품, 디딤판, 기준점에서의 x, 마지막으로 보낸 자리) — 창이 움직이면 따라간다
     prop_anchor: Option<(Prop, Owner, f64, (f64, f64))>,
-    /// 쏜 화면 지점 (take_sting으로 한 번 꺼낸다)
-    sting_at: Option<(f64, f64)>,
-    /// 이 시각(clock)부터 다시 쏠 수 있다
-    sting_ready_at: f64,
-    /// 들고 흔든 경로 (쏘기 판정)
-    shake: PathMeter,
-    /// 최근 클릭 (쏘기 판정)
-    pester: ClickMeter,
     /// 폴짝 동물의 걸음·벽 오르기 박자 (brain_hop.rs)
     hop_beat: crate::hop::Beat,
     /// 가끔 깡총거리는 동물의 이번 이동 토막 걸음 (brain_hop.rs)
@@ -693,10 +682,6 @@ impl Pet {
             gaze_up: false,
             above_since: None,
             prop_anchor: None,
-            sting_at: None,
-            sting_ready_at: 0.0,
-            shake: PathMeter::default(),
-            pester: ClickMeter::default(),
             hop_beat: Default::default(),
             bunny: Default::default(),
             thrown: false,
@@ -805,16 +790,17 @@ impl Pet {
             self.on_started();
             return;
         }
-        if let State::Sting { phase, remaining } = self.state {
-            self.update_sting(dt, world, phase, remaining);
-            self.on_started();
-            return;
-        }
         if self.update_control(dt, world) {
             self.on_started();
             return;
         }
         if self.update_social(dt, world) || self.update_catch_me(dt, world) {
+            self.on_started();
+            return;
+        }
+        // 내려앉아 있다가 친구에게 머리를 밟히는 나는 동물 (brain_meet.rs)
+        if let (true, State::Meet { phase, remaining }) = (self.perched_meet(), self.state) {
+            self.update_meet(dt, world, phase, remaining);
             self.on_started();
             return;
         }
@@ -879,8 +865,6 @@ impl Pet {
             State::CatchMe { dodge, .. } if dodge > 0.0 => Anim::Hop,
             State::CatchMe { .. } if self.cfg.hops => self.hop_anim(Move::Run),
             State::CatchMe { .. } => Anim::Run,
-            State::Sting { phase: StingPhase::Recoil, .. } => Anim::Annoyed,
-            State::Sting { .. } => Anim::Sting,
             State::Exit { side, .. } | State::Enter { side, .. } if visit::is_vertical(side) => self.vertical_anim(),
             State::Exit { .. } | State::Enter { .. } | State::ToFood { .. } | State::WantFood { walking: true } => Anim::Walk,
             State::WantFood { walking: false } if self.looking_up() => Anim::LookUp,
@@ -919,6 +903,9 @@ impl Pet {
         };
         // 구르기 그림이 없는 동물: 넘어져 구르거나 굴러떨어지는 동안은 떨어지는 그림, 커서 놀이 썰매·눈덩이 굴리기·막 바꾼 스타일의 남은 구르기는 걷기
         let anim = match (anim, self.state) {
+            // 빠른 새: 친구 화면으로 쌩 나가고 들어올 땐 빠른 날기, 떠서 쉴 땐 파닥파닥 (idle은 내려앉아 앉은 그림)
+            (Anim::Walk, State::Exit { .. } | State::Enter { .. }) if self.cfg.swift => Anim::Run,
+            (Anim::Idle, State::Idle { .. } | State::Turn { .. }) if self.cfg.swift && self.standing.is_none() => Anim::Walk,
             (Anim::Roll, State::Tumble { .. } | State::Air { .. }) if self.cfg.no_roll => Anim::Fall,
             (Anim::Roll, _) if self.cfg.no_roll => Anim::Walk,
             _ => anim,
@@ -1609,11 +1596,6 @@ impl Pet {
         }
     }
 
-    /// 쏜 화면 지점 (한 번 꺼내면 None) — 앱이 그 자리에 침 자국 창을 띄운다
-    pub fn take_sting(&mut self) -> Option<(f64, f64)> {
-        self.sting_at.take()
-    }
-
     /// 이번 틱에 띄울 말풍선 (한 번 꺼내면 None)
     pub fn take_speech(&mut self) -> Option<Speech> {
         self.speech.take()
@@ -1632,10 +1614,6 @@ impl Pet {
         if self.is_held() || self.housed || self.in_transit() {
             return;
         }
-        // 쏘기는 콕! 할 때까지 손으로 막을 수 없다
-        if matches!(self.state, State::Sting { phase: StingPhase::Alert | StingPhase::Dash, .. }) {
-            return;
-        }
         // 떠 있는 나는 동물은 디딤판 위처럼 제자리에서 눌린다
         let grounded = (self.standing.is_some() || self.cfg.flies) && !self.off_surface();
         let was_sleeping = matches!(self.state, State::Sleep { .. } | State::Annoyed { .. });
@@ -1649,7 +1627,6 @@ impl Pet {
         self.thrown = false;
         // 머리 위 친구를 그냥 클릭하면 떨어진다 (같은 머리에 다시 서지 않는다). 끌어서 놓으면 다시 설 수 있다
         self.no_perch = self.is_on_head();
-        self.shake.clear();
         // 나는 동물: 눌리면 가던 길은 잊는다 (놓인 자리에서 다시 정한다)
         self.flight = None;
         // 놀던 중이면 놀이는 끝난다 — 무시해도 놀이로 돌아가지 않고 잠깐 앉는다
@@ -1675,14 +1652,11 @@ impl Pet {
                     self.inside = None;
                     self.state = State::Dragged;
                     self.drag_to(cx, cy);
-                    self.shake.push(self.clock, start_cx, start_cy);
-                    self.shake_check(cx, cy);
                 }
             }
             State::Dragged => {
                 self.record(cx, cy);
                 self.drag_to(cx, cy);
-                self.shake_check(cx, cy);
             }
             _ => {}
         }
@@ -1749,7 +1723,7 @@ impl Pet {
             return true;
         }
         let settled = (self.standing.is_some() || self.cfg.flies) && !self.off_surface() && !self.is_held() && !self.in_transit();
-        settled && self.home_trip.is_none() && !matches!(self.state, State::Sting { .. })
+        settled && self.home_trip.is_none()
     }
 
     /// 성장 축하 중이거나 하트 중
@@ -1852,7 +1826,7 @@ impl Pet {
     /// 입 (손에 든 음식이 여기 닿으면 받아먹는다)
     pub fn mouth(&self) -> (f64, f64) {
         if self.cfg.flies {
-            crate::sting::face_point(self.body.x, self.body.y, self.cfg.size)
+            (self.body.x, self.body.y - food::FLY_MOUTH_HEIGHT * self.cfg.size)
         } else {
             (self.body.x, self.body.y - food::MOUTH_HEIGHT * self.cfg.size)
         }
@@ -2063,7 +2037,7 @@ impl Pet {
             None => {
                 let x = food::bowl_x(self.body.x, self.facing, self.scaled(food::BOWL_GAP), lo, hi);
                 trip.target = Some((st.owner, x - ax));
-                self.show_prop_on(Prop::for_food(trip.food, false), st.owner, x - ax, world);
+                self.show_prop_on(Prop::for_food(trip.food), st.owner, x - ax, world);
                 x
             }
         };
@@ -2073,7 +2047,7 @@ impl Pet {
         let remaining = remaining - dt;
         if dx.abs() > step && remaining <= 0.0 {
             // 너무 오래 걸렸다 — 그릇을 지금 자리로 옮겨 여기서 먹는다
-            self.show_prop_on(Prop::for_food(trip.food, false), st.owner, self.body.x - ax, world);
+            self.show_prop_on(Prop::for_food(trip.food), st.owner, self.body.x - ax, world);
             self.start_eating();
             return;
         }
@@ -2107,14 +2081,6 @@ impl Pet {
             };
             return;
         }
-        // 꿀벌: 깨어 있을 때 2초 안에 세 번 누르면 쏜다
-        if let State::Pressed { was_sleeping: false, .. } = self.state {
-            // 배고파서 음식을 고르려고 누르는 건 괴롭힘이 아니다
-            if self.cfg.stings && !self.hungry && self.pester.push(self.clock) && self.can_sting_now() {
-                self.start_sting();
-                return;
-            }
-        }
         match self.state {
             State::Pressed { grounded: true, was_sleeping: true, .. } => self.click_sleeper(),
             State::Pressed { grounded: true, .. } => {
@@ -2132,6 +2098,11 @@ impl Pet {
                 // 친구 동물: 반반 애교 / 잡아 봐! (brain_guestplay.rs)
                 if self.guest.is_some() {
                     self.guest_click();
+                    return;
+                }
+                // 잘 놀라는 동물 (레서판다): 반쯤은 깜짝 벌떡
+                if self.cfg.special == Some(Special::Surprise) && self.rng.f64() < behavior::SURPRISE_CLICK_CHANCE {
+                    self.startle();
                     return;
                 }
                 let reaction = match behavior::pick_click_outcome(&mut self.rng, self.cfg.personality, self.hungry) {
@@ -2252,21 +2223,8 @@ impl Pet {
         self.state = match self.state {
             State::Sleep { .. } => State::Annoyed { remaining: TICKLE_HOLD, tickled_for: 0.0 },
             State::Annoyed { tickled_for, .. } => State::Annoyed { remaining: TICKLE_HOLD, tickled_for },
-            // 꿀벌은 간질이면 낄낄대지 않고 화나서 쏜다 (쏜 지 8초가 안 됐으면 투덜대기만)
-            State::Tickled { .. } if self.cfg.stings && self.can_sting_now() => {
-                self.start_sting();
-                return;
-            }
             State::Tickled { .. } => State::Tickled { remaining: TICKLE_HOLD },
-            State::Special { .. } | State::Eating { .. } | State::LevelUp { .. } | State::Sting { .. } | State::ToFood { .. } => return,
-            _ if self.cfg.stings => {
-                if self.can_sting_now() {
-                    self.start_sting();
-                    return;
-                }
-                self.speech = Some(Speech::Grumpy);
-                State::Tickled { remaining: TICKLE_HOLD }
-            }
+            State::Special { .. } | State::Eating { .. } | State::LevelUp { .. } | State::ToFood { .. } => return,
             _ => {
                 if let Some(kind) = self.cfg.special {
                     if self.rng.f64() < kind.tickle_chance() {
@@ -2280,18 +2238,28 @@ impl Pet {
         };
     }
 
+    /// 깜짝 놀라 벌떡 선다 (Special::Surprise가 있는 동물만 — 레서판다). 놀랐으면 true
+    pub(crate) fn startle(&mut self) -> bool {
+        if self.cfg.special != Some(Special::Surprise) || self.standing.is_none() {
+            return false;
+        }
+        self.pacing.after_beat = None;
+        self.start_special(Special::Surprise);
+        true
+    }
+
     pub(crate) fn start_special(&mut self, kind: Special) {
         // 공룡: 불·크앙·쿵쾅 중 하나 (간질이면 불·크앙이 더 자주)
         let kind = if kind.is_dino() { behavior::pick_dino(&mut self.rng, self.tickling) } else { kind };
         self.stomp_out = kind == Special::Stomp;
         self.speech = match kind {
             Special::Arch => Some(Speech::Hiss),
-            Special::Wag => Some(Speech::Chatter),
             // 목이 말풍선 자리까지 솟는다 — 말없이
             Special::NeckStretch => None,
             Special::Fire => Some(Speech::Fire),
             Special::Roar => Some(Speech::Roar),
             Special::Stomp => Some(Speech::Stomp),
+            Special::Surprise => Some(Speech::Surprise),
         };
         self.state = State::Special { kind, remaining: behavior::range(&mut self.rng, kind.secs()) };
     }
@@ -2514,7 +2482,6 @@ impl Pet {
             | State::Farewell { .. }
             | State::Away
             | State::InnerClimb { .. }
-            | State::Sting { .. }
             | State::ToFood { .. }
             | State::WantFood { .. }
             | State::Leap { .. }
@@ -3111,6 +3078,10 @@ mod fly;
 mod fly_tests;
 
 #[cfg(test)]
+#[path = "brain_swift_tests.rs"]
+mod swift_tests;
+
+#[cfg(test)]
 #[path = "brain_food_tests.rs"]
 mod food_tests;
 
@@ -3169,6 +3140,10 @@ mod noroll_tests;
 #[cfg(test)]
 #[path = "brain_lookup_tests.rs"]
 mod lookup_tests;
+
+#[cfg(test)]
+#[path = "brain_surprise_tests.rs"]
+mod surprise_tests;
 
 /// 기대고 있는 창 (게임 루프가 매 틱 그 창 경계만 다시 읽는다)
 #[path = "brain_ride.rs"]
@@ -3293,9 +3268,9 @@ mod tests {
         p
     }
 
-    /// 시뮬레이션용 꿀벌 (실제 걸음 빠르기)
-    pub(super) fn sim_bee() -> PetConfig {
-        PetConfig { flies: true, stings: true, walk_speed: 70.0, ..sim_cfg() }
+    /// 시뮬레이션용 나는 동물 (실제 걸음 빠르기)
+    pub(super) fn sim_flyer() -> PetConfig {
+        PetConfig { flies: true, walk_speed: 70.0, ..sim_cfg() }
     }
 
     /// 시뮬레이션용 개구리 (실제 크기·빠르기·성격)
@@ -3739,16 +3714,16 @@ mod tests {
     #[test]
     fn front_animations_are_the_tricks_and_tickle() {
         let all = [Anim::Walk, Anim::Run, Anim::Roll, Anim::Idle, Anim::Look, Anim::Sleep, Anim::Hop, Anim::Fall, Anim::Dragged,
-            Anim::Land, Anim::SitFront, Anim::Wave, Anim::Tilt, Anim::Belly, Anim::Stretch, Anim::Heart, Anim::Tickle, Anim::Annoyed, Anim::Arch, Anim::Wag, Anim::Hungry, Anim::Eat, Anim::LevelUp, Anim::Huff, Anim::Climb, Anim::Slide];
+            Anim::Land, Anim::SitFront, Anim::Wave, Anim::Tilt, Anim::Belly, Anim::Stretch, Anim::Heart, Anim::Tickle, Anim::Annoyed, Anim::Arch, Anim::Hungry, Anim::Eat, Anim::LevelUp, Anim::Huff, Anim::Climb, Anim::Slide];
         let front: Vec<Anim> = all.into_iter().filter(|a| a.is_front()).collect();
-        assert_eq!(front, vec![Anim::SitFront, Anim::Wave, Anim::Tilt, Anim::Belly, Anim::Stretch, Anim::Heart, Anim::Tickle, Anim::Wag, Anim::Hungry, Anim::Eat, Anim::LevelUp, Anim::Huff]);
+        assert_eq!(front, vec![Anim::SitFront, Anim::Wave, Anim::Tilt, Anim::Belly, Anim::Stretch, Anim::Heart, Anim::Tickle, Anim::Hungry, Anim::Eat, Anim::LevelUp, Anim::Huff]);
         assert_eq!(serde_json::to_string(&Anim::SitFront).unwrap(), "\"sit_front\"");
     }
 
     #[test]
     fn every_anim_name_is_a_required_manifest_animation() {
         let all = [Anim::Walk, Anim::Run, Anim::Roll, Anim::Idle, Anim::Look, Anim::Sleep, Anim::Hop, Anim::Fall, Anim::Dragged,
-            Anim::Land, Anim::SitFront, Anim::Wave, Anim::Tilt, Anim::Belly, Anim::Stretch, Anim::Heart, Anim::Tickle, Anim::Annoyed, Anim::Hungry, Anim::Eat, Anim::LevelUp, Anim::Arch, Anim::Wag, Anim::Huff, Anim::Climb, Anim::Slide, Anim::Sting, Anim::BigJump, Anim::NeckStretch, Anim::LookUp, Anim::Fire, Anim::Roar, Anim::Stomp];
+            Anim::Land, Anim::SitFront, Anim::Wave, Anim::Tilt, Anim::Belly, Anim::Stretch, Anim::Heart, Anim::Tickle, Anim::Annoyed, Anim::Hungry, Anim::Eat, Anim::LevelUp, Anim::Arch, Anim::Huff, Anim::Climb, Anim::Slide, Anim::BigJump, Anim::NeckStretch, Anim::LookUp, Anim::Fire, Anim::Roar, Anim::Stomp, Anim::Surprise];
         let names: Vec<String> = all.iter().map(|a| serde_json::to_string(a).unwrap().trim_matches('"').to_string()).collect();
         let mut expected: Vec<&str> = crate::manifest::REQUIRED_ANIMS.to_vec();
         expected.extend(crate::manifest::OPTIONAL_ANIMS);
@@ -3806,7 +3781,7 @@ mod tests {
         match a {
             Anim::Walk | Anim::Run => Some(behavior::Family::Move),
             Anim::Roll => Some(behavior::Family::Roll),
-            Anim::Arch | Anim::Wag => Some(behavior::Family::Special),
+            Anim::Arch => Some(behavior::Family::Special),
             a if a.is_front() => Some(behavior::Family::Front),
             _ => None,
         }
@@ -3814,7 +3789,7 @@ mod tests {
 
     #[test]
     fn activities_only_change_family_after_sitting_a_moment() {
-        for special in [None, Some(Special::Arch), Some(Special::Wag)] {
+        for special in [None, Some(Special::Arch)] {
             for personality in [Personality::Friendly, Personality::Aloof] {
                 for seed in 0..6 {
                     let seq = anim_sequence(PetConfig { special, personality, ..sim_cfg() }, seed);
@@ -4374,7 +4349,7 @@ mod tickle_tests {
         let w = world(vec![]);
         let mut p = Pet::new(cfg(), 0.0, 0.0, 1);
         place(&mut p, &w, Owner::Ground(0), 900.0, State::Idle { remaining: 1000.0, look: false });
-        p.start_special(Special::Wag);
+        p.start_special(Special::Arch);
         assert!(matches!(p.state, State::Special { .. }));
         p.set_special(None);
         assert_eq!(p.cfg.special, None);
@@ -4502,7 +4477,7 @@ mod tickle_tests {
         let w = world(vec![w1()]);
         let mut p = Pet::new(cfg(), 0.0, 0.0, 1);
         place(&mut p, &w, Owner::Window(1), 800.0, idle());
-        p.start_special(Special::Wag);
+        p.start_special(Special::Arch);
         p.take_speech();
         p.chatter_timer = 0.001;
         p.update(DT, &w);
@@ -4571,25 +4546,21 @@ mod special_tests {
     #[test]
     fn rest_specials_follow_species_chances() {
         let arch = rest_share(Some(Special::Arch));
-        let wag = rest_share(Some(Special::Wag));
         assert!((0.05..=0.11).contains(&arch), "arch {arch}");
-        assert!((0.09..=0.15).contains(&wag), "wag {wag}");
         assert_eq!(rest_share(None), 0.0);
     }
 
     #[test]
     fn tickling_sometimes_triggers_the_special() {
         let arch = tickle_share(Some(Special::Arch));
-        let wag = tickle_share(Some(Special::Wag));
         assert!((0.19..=0.31).contains(&arch), "arch {arch}");
-        assert!((0.24..=0.36).contains(&wag), "wag {wag}");
         assert_eq!(tickle_share(None), 0.0);
     }
 
     #[test]
     fn special_speech_facing_and_ending() {
         let w = world(vec![w1()]);
-        for (kind, speech, anim, front) in [(Special::Arch, Speech::Hiss, Anim::Arch, false), (Special::Wag, Speech::Chatter, Anim::Wag, true)] {
+        for (kind, speech, anim, front) in [(Special::Arch, Speech::Hiss, Anim::Arch, false)] {
             let mut p = Pet::new(with(Some(kind)), 0.0, 0.0, 1);
             place(&mut p, &w, Owner::Window(1), 800.0, State::Idle { remaining: 100.0, look: false });
             p.start_special(kind);

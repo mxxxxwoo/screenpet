@@ -75,7 +75,7 @@ pub const CATALOG: &[GiftList] = &[
         key: "cat",
         title: "고양이",
         emoji: "🐱",
-        species: &["cat"],
+        species: &["cat", "persian"],
         speech: "...for you. hmph.",
         items: &[
             item("cat_fishbone", "생선 뼈"),
@@ -87,18 +87,18 @@ pub const CATALOG: &[GiftList] = &[
         ],
     },
     GiftList {
-        key: "dog",
-        title: "강아지",
-        emoji: "🐶",
-        species: &["dog"],
-        speech: "woof! for you!",
+        key: "squirrel",
+        title: "다람쥐",
+        emoji: "🐿️",
+        species: &["squirrel"],
+        speech: "chk! for you!",
         items: &[
-            item("dog_bone", "뼈다귀"),
-            item("dog_ball", "테니스공"),
-            item("dog_stick", "나뭇가지"),
-            item("dog_frisbee", "원반"),
-            item("dog_slipper", "슬리퍼"),
-            item("dog_sock", "낡은 양말"),
+            item("squirrel_acorn", "도토리"),
+            item("squirrel_pinecone", "솔방울"),
+            item("squirrel_walnut", "호두"),
+            item("squirrel_ginkgo", "노란 은행잎"),
+            item("squirrel_fluff", "꼬리 솜털"),
+            item("squirrel_mushroom", "작은 버섯"),
         ],
     },
     GiftList {
@@ -114,36 +114,6 @@ pub const CATALOG: &[GiftList] = &[
             item("rabbit_radish", "무"),
             item("rabbit_daisy", "데이지"),
             item("rabbit_strawberry", "딸기"),
-        ],
-    },
-    GiftList {
-        key: "bear",
-        title: "곰",
-        emoji: "🐻",
-        species: &["bear"],
-        speech: "found this!",
-        items: &[
-            item("bear_honey", "꿀단지"),
-            item("bear_acorn", "도토리"),
-            item("bear_salmon", "연어"),
-            item("bear_berry", "산딸기"),
-            item("bear_pinecone", "솔방울"),
-            item("bear_mushroom", "버섯"),
-        ],
-    },
-    GiftList {
-        key: "bee",
-        title: "꿀벌",
-        emoji: "🐝",
-        species: &["bee"],
-        speech: "bzz! for you!",
-        items: &[
-            item("bee_flower", "꽃"),
-            item("bee_honeycomb", "벌집 조각"),
-            item("bee_pollen", "꽃가루 공"),
-            item("bee_dew", "이슬방울"),
-            item("bee_tulip", "튤립"),
-            item("bee_honeydrop", "꿀 방울"),
         ],
     },
     GiftList {
@@ -204,6 +174,51 @@ pub const CATALOG: &[GiftList] = &[
             item("duck_feather", "오리 깃털"),
             item("duck_shell", "조개껍데기"),
             item("duck_reed", "갈대"),
+        ],
+    },
+    GiftList {
+        key: "bird",
+        title: "새",
+        emoji: "🐦",
+        species: &["bird"],
+        speech: "chirp! for you!",
+        items: &[
+            item("bird_gourdseed", "박씨"),
+            item("bird_feather", "제비 깃털"),
+            item("bird_twig", "둥지 지푸라기"),
+            item("bird_berry", "빨간 열매"),
+            item("bird_egg", "하늘색 알"),
+            item("bird_dandelion", "민들레 홀씨"),
+        ],
+    },
+    GiftList {
+        key: "penguin",
+        title: "펭귄",
+        emoji: "🐧",
+        species: &["penguin"],
+        speech: "pip! for you!",
+        items: &[
+            item("penguin_pebble", "반들반들 조약돌"),
+            item("penguin_ice", "얼음 조각"),
+            item("penguin_fish", "은빛 멸치"),
+            item("penguin_snowflake", "눈송이"),
+            item("penguin_down", "아기 솜털"),
+            item("penguin_shell", "소라 껍데기"),
+        ],
+    },
+    GiftList {
+        key: "redpanda",
+        title: "레서판다",
+        emoji: "🐾",
+        species: &["redpanda"],
+        speech: "kyu! for you!",
+        items: &[
+            item("redpanda_bamboo", "대나무잎"),
+            item("redpanda_berry", "산딸기"),
+            item("redpanda_stick", "작은 나뭇가지"),
+            item("redpanda_maple", "빨간 단풍잎"),
+            item("redpanda_fluff", "꼬리 털뭉치"),
+            item("redpanda_flower", "들꽃"),
         ],
     },
     GiftList {
@@ -531,7 +546,7 @@ impl LiveGift {
 
 /// 선물을 떨어뜨려도 되는 몸짓: 걷거나 쉬는 중 (먹기·잠·끌려가기·벽 타기·장난 도중엔 기다린다)
 pub fn calm_anim(anim: Anim) -> bool {
-    matches!(anim, Anim::Walk | Anim::Run | Anim::Idle | Anim::Look | Anim::SitFront | Anim::Wag | Anim::Stretch | Anim::Tilt | Anim::Hop | Anim::LookUp)
+    matches!(anim, Anim::Walk | Anim::Run | Anim::Idle | Anim::Look | Anim::SitFront | Anim::Stretch | Anim::Tilt | Anim::Hop | Anim::LookUp)
 }
 
 /// 몸 크기에 대해 선물이 놓이는 앞쪽 거리

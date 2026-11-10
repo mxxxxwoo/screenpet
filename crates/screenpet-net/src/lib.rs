@@ -20,6 +20,7 @@
 //! - `relay`: the relay transport (`screenpet-relay` over WebSocket) for
 //!   friends outside the LAN, friend codes, LAN-preferred link choice.
 
+mod devices;
 mod discovery;
 pub mod ladder;
 mod noise;
@@ -31,7 +32,7 @@ mod tcp;
 mod transport;
 
 pub use noise::{hex32, to_hex, SAS_EMOJI};
-pub use protocol::{Fling, LadderMsg, Side, Steer, Toss, VSide, Visit, WirePlayer, WireResult, LADDER_MIN_VERSION, MAX_FRIENDS, MAX_NOTE, PROTOCOL_VERSION};
+pub use protocol::{Fling, LadderMsg, Side, Steer, Toss, VSide, Visit, WireCare, WirePlayer, WireResult, DEVICES_MIN_VERSION, LADDER_MIN_VERSION, MAX_DEVICES, MAX_FRIENDS, MAX_NOTE, PROTOCOL_VERSION};
 pub use relay::{normalize_code, parse_relay_key, DEFAULT_RELAY_KEY, DEFAULT_RELAY_URL};
 
 use protocol::{Control, Message};
@@ -105,6 +106,17 @@ pub struct Timing {
     /// First wait before reconnecting to the relay (doubles up to 60 s); also
     /// the first redial delay for a friend whose relay link failed.
     pub relay_retry: Duration,
+    /// 📱 After a link code matched, both users must press 확인 within this
+    /// time ([`Net::confirm_device`]); otherwise it is cancelled on both.
+    pub device_confirm_timeout: Duration,
+    /// 📱 A computer that goes on standby keeps its friend links this long
+    /// (so the app can call its pet home) before it closes them.
+    pub standby_grace: Duration,
+    /// 📱 The computer that plays shares a changed pet or care at most this
+    /// often (changes in between are coalesced) …
+    pub device_state_every: Duration,
+    /// … and the same state again this often (in case it went missing).
+    pub device_state_refresh: Duration,
 }
 
 impl Default for Timing {
@@ -116,6 +128,10 @@ impl Default for Timing {
             conn_timeout: Duration::from_secs(6),
             invite_timeout: Duration::from_secs(20),
             relay_retry: Duration::from_secs(5),
+            device_confirm_timeout: Duration::from_secs(60),
+            standby_grace: Duration::from_secs(5),
+            device_state_every: Duration::from_secs(2),
+            device_state_refresh: Duration::from_secs(60),
         }
     }
 }
@@ -152,6 +168,58 @@ pub struct NetConfig {
     /// [`DEFAULT_RELAY_KEY`] with [`DEFAULT_RELAY_URL`]). A relay that
     /// presents another key is refused. `None` = trust on each connect.
     pub relay_key: Option<[u8; 32]>,
+    /// My linked other computer and our stored secret (see
+    /// [`Net::new_link_code`]); persist it with the friend. Ignored if no friend.
+    pub device: Option<(String, DeviceSecret)>,
+    /// Friends a friend introduced as its other computers: (device id, the
+    /// introducing friend's id). They leave together with that friend.
+    pub introduced: Vec<(String, String)>,
+    /// Friends added from another computer or an introduction that have not
+    /// yet shown on a link that they know us (see [`FriendInfo::pending`]).
+    pub pending: Vec<String>,
+    /// When each of `pending` was added (unix seconds), so a restart doesn't
+    /// restart its clock. One missing here counts from this start.
+    pub pending_added: Vec<(String, u64)>,
+}
+
+/// The secret two linked computers share (persist it; never show or log it:
+/// `Debug` prints no bytes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DeviceSecret(pub [u8; 32]);
+
+impl std::fmt::Debug for DeviceSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceSecret(..)")
+    }
+}
+
+/// Why [`Net::new_link_code`] / [`Net::enter_link_code`] could not start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkError {
+    /// Not a friend.
+    NotFriend,
+    /// Already linked to this other computer (unlink it first): at most two computers.
+    Taken(String),
+    /// Not a link code.
+    Invalid,
+    /// The friend is not connected now.
+    Offline,
+    /// The friend's build does not know linking.
+    Old,
+}
+
+/// What [`Net::friend_info`] knows about a friend besides its key.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FriendInfo {
+    /// It is my linked other computer.
+    pub device: bool,
+    /// It was introduced by this friend as one of its computers.
+    pub via: Option<String>,
+    /// Added from another computer or an introduction and not yet seen
+    /// knowing us; not removed when it says it doesn't (yet).
+    pub pending: bool,
+    /// When it was added unconfirmed (unix seconds; `None` if confirmed).
+    pub pending_since: Option<u64>,
 }
 
 impl NetConfig {
@@ -168,6 +236,10 @@ impl NetConfig {
             timing: Timing::default(),
             relay_url: None,
             relay_key: None,
+            device: None,
+            introduced: Vec::new(),
+            pending: Vec::new(),
+            pending_added: Vec::new(),
         }
     }
 }
@@ -226,6 +298,56 @@ pub enum NetEvent {
     /// `already_friend`, `busy`, `rate`, `timeout`, `full` (we have `MAX_FRIENDS`),
     /// `disabled` (the relay has friend codes switched off).
     CodeFailed { code: String, reason: String },
+    /// A friend was pinned without pairing: from `device_friends` of my
+    /// linked other computer (`via: None`; `name` and `side` are its
+    /// first values, clamped but otherwise unchecked), or introduced by friend
+    /// `via` as one of its computers (`name` empty). [`Net::friends`] lists it.
+    FriendAdded { id: String, name: String, via: Option<String>, side: Option<String> },
+    /// A friend added without pairing was removed: introduced by a friend
+    /// that is now removed, or never confirmed (a week, or it said three
+    /// times that it doesn't know us).
+    FriendDropped { id: String },
+    /// The link code matched with friend `id`: ask the user "본인의 PC가
+    /// 맞습니까?" and answer with [`Net::confirm_device`]. Nothing is linked,
+    /// stored or shared until both computers confirm (then
+    /// [`NetEvent::DeviceLinked`]); a no, a lost link or
+    /// `Timing::device_confirm_timeout` gives [`NetEvent::DeviceLinkCancelled`]
+    /// on both.
+    DeviceConfirm { id: String },
+    /// Linking with friend `id` was cancelled before both confirmed (one of
+    /// us said no, did not answer in time, or the link was lost). Nothing was
+    /// linked or stored.
+    DeviceLinkCancelled { id: String },
+    /// Friend `id` is now my linked other computer: a code matched and both
+    /// users confirmed (store [`Net::device_secret`]). Friend lists flow on this link
+    /// now — send it mine ([`Net::send_device_friends`]).
+    DeviceLinked { id: String },
+    /// Linking with friend `id` by code did not work: `reason` = `wrong`
+    /// (`left` tries remain on the code's side), `locked` (too many wrong
+    /// tries: the code is gone), `none` (no live code for us there),
+    /// `taken` (one of us is linked to another computer).
+    DeviceLinkFailed { id: String, reason: String, left: u32 },
+    /// My linked computer `id` proved our stored secret on its new link:
+    /// friend lists flow now — send it mine ([`Net::send_device_friends`]).
+    DeviceProven { id: String },
+    /// Friend `id` is no longer my linked computer (it unlinked, or did not
+    /// hold our secret); still a friend. Forget the stored secret.
+    DeviceUnlinked { id: String },
+    /// My other computer `from` sent its friends (already merged). `want` =
+    /// it asks for mine ([`Net::send_device_friends`]).
+    DeviceSynced { from: String, want: bool },
+    /// 📱 Which of my two linked computers plays changed. `me` = this one is
+    /// on standby: friend links close after `Timing::standby_grace` (call my
+    /// pet home from friends now) and none open until it plays again.
+    /// `device` = my linked computer is on standby (I play; don't send it my
+    /// pet). Both `false` when the two can't reach each other: each plays.
+    Standby { me: bool, device: bool },
+    /// 📱 My linked computer `from`, which plays, shares its selected pet and
+    /// every pet's care (or hands them over as I take over). Shape-checked
+    /// (pet ids, at most `MAX_CARE` entries, one per pet); the app checks
+    /// species and clamps values, then adopts it. Only when it differs from
+    /// the last state shared either way.
+    DeviceState { from: String, pet: Option<String>, care: Vec<WireCare> },
 }
 
 /// A peer id heard via discovery. Announcements are unauthenticated hints.
@@ -306,15 +428,27 @@ const ASK_EVERY: Duration = Duration::from_secs(2);
 /// Steering (control mode): up to 30 messages at once, then 30 per second.
 const STEER_BURST: f64 = 30.0;
 const STEER_EVERY: Duration = Duration::from_micros(33_334);
-/// Thrown objects: up to 10 at once, then 10 per minute.
-const TOSS_BURST: f64 = 10.0;
-const TOSS_EVERY: Duration = Duration::from_secs(6);
+/// Thrown objects: up to 50 at once (five volleys), then 50 per minute.
+const TOSS_BURST: f64 = 50.0;
+const TOSS_EVERY: Duration = Duration::from_millis(1200);
 /// Visit messages: far more than a pet walking back and forth ever sends.
 const VISIT_BURST: f64 = 20.0;
 const VISIT_EVERY: Duration = Duration::from_millis(500);
 /// Ladder messages: a game takes a handful per friend.
 const LADDER_BURST: f64 = 20.0;
 const LADDER_EVERY: Duration = Duration::from_millis(500);
+/// Friend lists between my computers and introductions: a few on each
+/// connect or change.
+const LINKS_BURST: f64 = 6.0;
+const LINKS_EVERY: Duration = Duration::from_secs(5);
+/// Linking by code (two messages per try; a code allows `devices::CODE_TRIES`)
+/// and the secret proof on each connect.
+const CODES_BURST: f64 = 16.0;
+const CODES_EVERY: Duration = Duration::from_secs(2);
+/// 📱 Shared pet and care: the sender coalesces to one per
+/// `Timing::device_state_every` (plus a claim's handover), so a few at once.
+const STATES_BURST: f64 = 4.0;
+const STATES_EVERY: Duration = Duration::from_secs(1);
 
 /// What one friend may make us process (over budget = dropped, the link stays:
 /// a flooding friend can't spam the app with events). Kept per friend, not per
@@ -326,9 +460,23 @@ pub(crate) struct Budget {
     pub tosses: Bucket,
     pub visits: Bucket,
     pub ladder: Bucket,
+    pub links: Bucket,
+    /// `device_*` messages (linking by code, proving the stored secret).
+    pub codes: Bucket,
+    /// `device_state` (its own bucket: shared pets never starve a claim).
+    pub states: Bucket,
 }
 
 impl Budget {
+    /// Spend on a `device_*` message (`state` = a `device_state`).
+    pub fn device(&mut self, state: bool, now: Instant) -> bool {
+        if state {
+            self.states.take(now)
+        } else {
+            self.codes.take(now)
+        }
+    }
+
     fn new(now: Instant) -> Budget {
         Budget {
             asks: Bucket::new(now, ASK_BURST, ASK_EVERY),
@@ -336,6 +484,9 @@ impl Budget {
             tosses: Bucket::new(now, TOSS_BURST, TOSS_EVERY),
             visits: Bucket::new(now, VISIT_BURST, VISIT_EVERY),
             ladder: Bucket::new(now, LADDER_BURST, LADDER_EVERY),
+            links: Bucket::new(now, LINKS_BURST, LINKS_EVERY),
+            codes: Bucket::new(now, CODES_BURST, CODES_EVERY),
+            states: Bucket::new(now, STATES_BURST, STATES_EVERY),
         }
     }
 }
@@ -364,6 +515,8 @@ pub(crate) struct Conn {
     pub since: Instant,
     /// Counts against `MAX_UNVERIFIED_INBOUND` while set.
     pub unverified: Arc<AtomicBool>,
+    /// Linking by code / proving the stored secret on this link.
+    pub dev: devices::DevLink,
 }
 
 /// What a redial backoff applies to.
@@ -420,6 +573,41 @@ pub(crate) struct State {
     /// Friend id → what it may still make us process. Only ever holds
     /// authenticated friends, and leaves with the friend.
     pub budgets: HashMap<String, Budget>,
+    /// My linked other computer and our secret (at most one: two computers).
+    pub device: Option<(String, [u8; 32])>,
+    /// The link code I am showing (for one friend).
+    pub link_code: Option<devices::LinkCode>,
+    /// Introduced device id → the friend that introduced it.
+    pub via: HashMap<String, String>,
+    /// Friends added without pairing, not yet seen knowing us → when they
+    /// were added (unix seconds; see `devices::expire_pending`).
+    pub pending: HashMap<String, u64>,
+    /// Unconfirmed friend → authenticated hellos saying it doesn't know us.
+    pub pending_denied: HashMap<String, u32>,
+    /// 📱 Who plays, as far as I know: (term, install id) — the highest wins
+    /// (see `devices::tick_active`). Starts as (0, me).
+    pub active: (u64, String),
+    /// When the user last used this computer (`Net::set_idle`).
+    pub last_input: Option<Instant>,
+    /// Last time the link to my linked computer was up and proven.
+    pub device_seen: Option<Instant>,
+    /// As last reported (`NetEvent::Standby`): this computer / my linked one is on standby.
+    pub standby: bool,
+    pub device_standby: bool,
+    /// When this computer went on standby (friend links close after the grace).
+    pub standby_since: Option<Instant>,
+    /// 📱 The latest selected pet and care shared between my two computers:
+    /// mine (`Net::share_state`) or the one my linked computer shared.
+    pub dstate: Option<devices::SharedState>,
+    /// It changed since it was last sent (sent within `Timing::device_state_every`).
+    pub dstate_dirty: bool,
+    /// I changed it here since I last took one from my linked computer (a
+    /// handover then does not overwrite it).
+    pub dstate_edited: bool,
+    /// Last sent: (link token, term I played in, when).
+    pub dstate_sent: Option<(u64, u64, Instant)>,
+    /// I just claimed the play: my linked computer's handover may come until then.
+    pub handover_until: Option<Instant>,
 }
 
 impl State {
@@ -430,6 +618,14 @@ impl State {
 
     pub fn is_friend(&self, id: &str) -> bool {
         self.friends.iter().any(|f| f.id == id)
+    }
+    /// Only introduced by a friend and never seen knowing us: its key is that
+    /// friend's word alone, so a real (SAS-confirmed) pairing may replace it.
+    /// Only a friend's introduction vouches for this id's key (confirmed or not:
+    /// whoever holds that key can confirm itself), so a real SAS-confirmed
+    /// pairing may still replace it.
+    pub fn introduced_only(&self, id: &str) -> bool {
+        self.via.contains_key(id)
     }
     pub fn friend_key(&self, id: &str) -> Option<[u8; 32]> {
         self.friends.iter().find(|f| f.id == id).map(|f| f.public_key)
@@ -457,10 +653,27 @@ impl State {
         self.friends.retain(|f| f.id != id);
         self.paired_at.remove(id);
         self.budgets.remove(id);
+        if self.device.as_ref().is_some_and(|(d, _)| d == id) {
+            self.device = None; // unfriending also unlinks
+        }
+        if self.link_code.as_ref().is_some_and(|c| c.friend == id) {
+            self.link_code = None;
+        }
+        self.via.remove(id);
+        self.pending.remove(id);
+        self.pending_denied.remove(id);
         // Its address is no reason for trust any more
         self.trusted_ips.retain(|(friend, _), _| friend != id);
         self.trusted_rate.retain(|(friend, _), _| friend != id);
         self.friend_rate.retain(|(friend, _), _| friend != id);
+    }
+    /// 📱 On standby, only my linked computer may have a link.
+    pub fn standby_blocks(&self, id: &str) -> bool {
+        self.standby && !self.device.as_ref().is_some_and(|(d, _)| d == id)
+    }
+    /// 📱 On standby, a link from a friend's key (not my linked computer's) is closed before hello.
+    pub fn standby_refuses_key(&self, key: &[u8; 32]) -> bool {
+        self.standby && self.friends.iter().any(|f| f.public_key == *key && self.standby_blocks(&f.id))
     }
     pub fn is_trusted(&self, id: &str, ip: &str) -> bool {
         self.trusted_ips.contains_key(&(id.to_string(), ip.to_string()))
@@ -510,6 +723,9 @@ pub(crate) struct Shared {
     /// Display name (changes with [`Net::set_name`]).
     name: Mutex<String>,
     pub static_key: [u8; 32],
+    /// Public half of `static_key`, computed once: deriving it costs a
+    /// scalar multiplication, too slow to repeat per message under the state lock.
+    pub public_key: [u8; 32],
     pub timing: Timing,
     pub tcp_port: u16,
     /// Relay transport, if configured.
@@ -736,10 +952,29 @@ impl Net {
                 state.add_friend(&f.id, f.public_key);
             }
         }
+        if let Some((id, secret)) = cfg.device.as_ref().filter(|(id, _)| state.is_friend(id)) {
+            state.device = Some((id.clone(), secret.0));
+        }
+        for (id, via) in &cfg.introduced {
+            let mine = state.device.as_ref().is_some_and(|(d, _)| d == id);
+            if id != via && state.is_friend(id) && state.is_friend(via) && !mine {
+                state.via.insert(id.clone(), via.clone());
+            }
+        }
+        state.active = (0, cfg.id.clone());
+        state.last_input = Some(Instant::now());
+        let now = devices::unix_now();
+        for id in &cfg.pending {
+            if state.is_friend(id) {
+                let added = cfg.pending_added.iter().find(|(p, _)| p == id).map_or(now, |(_, t)| (*t).min(now));
+                state.pending.insert(id.clone(), added);
+            }
+        }
         let shared = Arc::new(Shared {
             id: cfg.id,
             name: Mutex::new(protocol::clamp_name(&cfg.name)),
             static_key: cfg.static_key,
+            public_key: own_public,
             timing: cfg.timing,
             tcp_port,
             relay: cfg.relay_url.filter(|u| !u.is_empty()).map(|u| relay::RelayClient::new(u, cfg.relay_key)),
@@ -868,17 +1103,206 @@ impl Net {
         }
     }
 
-    /// Forget a friend, tell them, and disconnect (gracefully). Never blocks.
+    /// Forget a friend, tell them, and disconnect (gracefully). The devices it
+    /// introduced go with it ([`NetEvent::FriendDropped`]). Never blocks.
     pub fn unfriend(&self, peer_id: &str) {
-        let link = {
+        let (link, dropped) = {
             let mut st = self.shared.state();
             st.remove_friend(peer_id);
             st.invites_out.remove(peer_id);
-            st.demote_friend_link(peer_id)
+            let dropped = devices::drop_introduced(&self.shared, &mut st, peer_id);
+            (st.demote_friend_link(peer_id), dropped)
         };
         if let Some(l) = link {
             l.send(&Message::Control(Control::Unfriend));
             l.finish();
+        }
+        devices::close_dropped(dropped);
+    }
+
+    /// Show a fresh link code for friend `id` (`ABCD-EFGH`; valid 10 minutes,
+    /// single use, gone after 5 wrong tries; replaces any earlier code). The
+    /// user types it on that other computer ([`Net::enter_link_code`]); then
+    /// both get [`NetEvent::DeviceLinked`]. Refused if I am linked to another
+    /// computer (at most two computers).
+    pub fn new_link_code(&self, id: &str) -> Result<String, LinkError> {
+        let mut st = self.shared.state();
+        if !st.is_friend(id) {
+            return Err(LinkError::NotFriend);
+        }
+        if let Some((other, _)) = st.device.as_ref().filter(|(d, _)| d != id) {
+            return Err(LinkError::Taken(other.clone()));
+        }
+        let (shown, code) = devices::new_code(id);
+        st.link_code = Some(code);
+        Ok(shown)
+    }
+
+    /// The user typed the code friend `id`'s computer is showing for us.
+    /// Proves it over the friend link without sending it; expect
+    /// [`NetEvent::DeviceLinked`] or [`NetEvent::DeviceLinkFailed`]. Never blocks.
+    pub fn enter_link_code(&self, id: &str, code: &str) -> Result<(), LinkError> {
+        let key = devices::typed_code_key(code).ok_or(LinkError::Invalid)?;
+        let mut st = self.shared.state();
+        if !st.is_friend(id) {
+            return Err(LinkError::NotFriend);
+        }
+        if let Some((other, _)) = st.device.as_ref().filter(|(d, _)| d != id) {
+            return Err(LinkError::Taken(other.clone()));
+        }
+        let Some((token, v, link)) = st.friend_links.get(id).and_then(|t| st.conns.get(t).filter(|c| matches!(c.kind, Kind::Friend)).map(|c| (*t, c.v, c.link.clone()))) else {
+            return Err(LinkError::Offline);
+        };
+        if v < DEVICES_MIN_VERSION {
+            return Err(LinkError::Old);
+        }
+        let msg = devices::start_entering(&mut st, token, key).ok_or(LinkError::Offline)?;
+        drop(st);
+        link.send(&Message::Control(msg));
+        Ok(())
+    }
+
+    /// Unlink my other computer `id`: forget our secret and tell it (it
+    /// forgets too). It stays a friend. `false` if it was not linked.
+    pub fn unlink_device(&self, id: &str) -> bool {
+        {
+            let mut st = self.shared.state();
+            if !st.device.as_ref().is_some_and(|(d, _)| d == id) {
+                return false;
+            }
+            st.device = None;
+            if let Some(c) = st.friend_links.get(id).copied().and_then(|t| st.conns.get_mut(&t)) {
+                c.dev.proven = false;
+            }
+        }
+        if let Some(link) = self.devices_link(id) {
+            link.send(&Message::Control(Control::DeviceUnlink));
+        }
+        true
+    }
+
+    /// The user's answer to [`NetEvent::DeviceConfirm`] for friend `id`
+    /// (`true` = 확인, `false` = 취소 or the window closed). `false` if
+    /// nothing waits for an answer from that friend.
+    pub fn confirm_device(&self, id: &str, yes: bool) -> bool {
+        let told = devices::answer(&self.shared, &mut self.shared.state(), id, yes);
+        let Some((link, msg)) = told else { return false };
+        link.send(&Message::Control(msg));
+        true
+    }
+
+    /// 📱 Play on this computer: my linked computer goes on standby (told over
+    /// our proven link). Also counts as the user using this computer. `false`
+    /// if that link is not up (then the two can't reach each other and both
+    /// play anyway; when they meet again the one used last plays).
+    pub fn claim_active(&self) -> bool {
+        let Some((link, msg)) = devices::claim(&self.shared) else { return false };
+        link.send(&Message::Control(msg))
+    }
+
+    /// 📱 How long ago the user last used this computer (the app reports it
+    /// regularly). Decides who plays when my two computers meet again.
+    pub fn set_idle(&self, idle: Duration) {
+        let now = Instant::now();
+        self.shared.state().last_input = Some(now.checked_sub(idle).unwrap_or(now));
+    }
+
+    /// 📱 My selected pet and every pet's care changed (or the regular
+    /// refresh): shared with my linked computer while this one plays
+    /// (coalesced, `Timing::device_state_every`). Changing it while on
+    /// standby counts as playing here only if the app also claims.
+    pub fn share_state(&self, pet: &str, care: Vec<WireCare>) {
+        devices::share(&mut self.shared.state(), pet, care);
+    }
+
+    /// 📱 This computer is on standby: my other computer plays.
+    pub fn standby(&self) -> bool {
+        self.shared.state().standby
+    }
+
+    /// 📱 My linked computer is on standby: this one plays (don't send it my pet).
+    pub fn device_standby(&self) -> bool {
+        self.shared.state().device_standby
+    }
+
+    /// My linked other computer, if any.
+    pub fn linked_device(&self) -> Option<String> {
+        self.shared.state().device.as_ref().map(|(d, _)| d.clone())
+    }
+
+    /// The secret shared with my linked computer `id` (to persist), if linked.
+    pub fn device_secret(&self, id: &str) -> Option<DeviceSecret> {
+        self.shared.state().device.as_ref().filter(|(d, _)| d == id).map(|(_, s)| DeviceSecret(*s))
+    }
+
+    /// Device marks and origin of friend `id` (`None` if no friend).
+    pub fn friend_info(&self, id: &str) -> Option<FriendInfo> {
+        let st = self.shared.state();
+        st.is_friend(id).then(|| FriendInfo { device: st.device.as_ref().is_some_and(|(d, _)| d == id), via: st.via.get(id).cloned(), pending: st.pending.contains_key(id), pending_since: st.pending.get(id).copied() })
+    }
+
+    /// The link of a connected friend whose build knows the device messages.
+    fn devices_link(&self, peer_id: &str) -> Option<Arc<secure::SecureLink>> {
+        let new = self.peer_version(peer_id).is_some_and(|v| v >= DEVICES_MIN_VERSION);
+        self.friend_link(peer_id).filter(|_| new)
+    }
+
+    /// Send my friends to `peer_id` if it is my linked computer and proved our
+    /// secret on its current link (otherwise `false`, nothing sent). Introduced and
+    /// unconfirmed friends are left out (they come from their own source), and
+    /// so is the receiver. `describe(id)` gives each friend's name and side
+    /// (first values for the receiver). `want` asks for its list back. Never blocks.
+    pub fn send_device_friends(&self, peer_id: &str, want: bool, describe: impl Fn(&str) -> (String, Option<String>)) -> bool {
+        let proven = {
+            let st = self.shared.state();
+            st.device.as_ref().is_some_and(|(d, _)| d == peer_id) && st.friend_conn(peer_id).is_some_and(|c| c.dev.proven)
+        };
+        if !proven {
+            return false;
+        }
+        let Some(link) = self.devices_link(peer_id) else { return false };
+        let ids: Vec<(String, [u8; 32])> = {
+            let st = self.shared.state();
+            st.friends
+                .iter()
+                .filter(|f| f.id != peer_id && !st.via.contains_key(&f.id) && !st.pending.contains_key(&f.id))
+                .take(MAX_FRIENDS)
+                .map(|f| (f.id.clone(), f.public_key))
+                .collect()
+        };
+        let friends = ids
+            .into_iter()
+            .map(|(id, key)| {
+                let (name, side) = describe(&id);
+                protocol::WireFriend { key: to_hex(&key), name: protocol::clamp_name(&name), side, id }
+            })
+            .collect();
+        link.send(&Message::Control(Control::DeviceFriends { friends, want }))
+    }
+
+    /// Introduce my linked computer (`MAX_DEVICES`) to friend `peer_id`,
+    /// unless it is one of them or its build does not know the message. `false`
+    /// = nothing sent (also when I have no other computer). Never blocks.
+    pub fn send_my_devices(&self, peer_id: &str) -> bool {
+        let devices: Vec<protocol::WireDevice> = {
+            let st = self.shared.state();
+            let mine = st.device.as_ref().map(|(d, _)| d.as_str());
+            if mine == Some(peer_id) {
+                return false;
+            }
+            st.friends
+                .iter()
+                .filter(|f| f.id != peer_id && mine == Some(f.id.as_str()) && !st.pending.contains_key(&f.id))
+                .take(MAX_DEVICES)
+                .map(|f| protocol::WireDevice { id: f.id.clone(), key: to_hex(&f.public_key) })
+                .collect()
+        };
+        if devices.is_empty() {
+            return false;
+        }
+        match self.devices_link(peer_id) {
+            Some(link) => link.send(&Message::Control(Control::MyDevices { devices })),
+            None => false,
         }
     }
 
@@ -956,7 +1380,7 @@ mod budget_tests {
     fn the_budget_is_per_friend_and_leaves_with_the_friend() {
         let now = Instant::now();
         let mut st = State::default();
-        for _ in 0..10 {
+        for _ in 0..50 {
             assert!(st.budget("a", now).tosses.take(now));
         }
         assert!(!st.budget("a", now).tosses.take(now));

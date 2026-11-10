@@ -267,15 +267,6 @@ const scenarios = {
     return { running, drew: w.byId("door-pet").style.backgroundPosition ?? null };
   },
 
-  // 침 그림을 못 읽으면 SVG 자국 (예전 인라인 onerror)
-  async stingFallback([style]) {
-    const w = openWindow("sting.html", { globals: { ART_STYLE: style } });
-    const [mark, fallback] = [w.byId("mark"), w.byId("fallback")];
-    const start = { src: mark.src, fallbackHidden: fallback.hidden };
-    mark.fire("error");
-    return { ...start, markHidden: mark.hidden, fallbackHiddenAfter: fallback.hidden };
-  },
-
   // 말풍선 글자는 안쪽 span에 (긴 글은 span이 …로 자른다)
   async bubbleText() {
     const w = openWindow("index.html", { replies: { slot_info: CAT } });
@@ -309,6 +300,21 @@ const scenarios = {
     }
     return { idle, advanced, spinWrites: count("transform") - tBefore, spinDistinct: new Set(spins).size, spin: spins[0] };
   },
+  // 픽셀 구르기: 배로 미끄러지는 동물(펭귄·눈사람)은 roll 줄을 돌리지 않고 틀고, 구르기 그림이 없는 동물은 idle 줄 (역시 안 돈다)
+  async pixelRoll([pet]) {
+    const slot = { pet, stage: "adult", scale: 1, style: "pixel" };
+    const w = openWindow("index.html", { replies: { slot_info: { ...slot, render: { anim: "roll", flip: false, heart: false } } } });
+    await tick();
+    w.emit("pet-render", { anim: "roll", flip: false, heart: false });
+    const transforms = [];
+    for (let i = 0; i < 20; i++) {
+      w.frame(16);
+      transforms.push(w.byId("pet").style.transform ?? "");
+    }
+    const [m, display] = vm.runInContext("[manifest, display]", w.sandbox);
+    const pos = w.byId("pet").style.backgroundPosition;
+    return { hasRoll: !!m.animations.roll, row: Math.round(-parseFloat(pos.split(" ")[1]) / display), rollRow: m.animations.roll?.row ?? null, idleRow: m.animations.idle.row, rotates: transforms.some((t) => t.includes("rotate")) };
+  },
   async drawWritesHouse() {
     const w = openWindow("house.html", { replies: { slot_info: CAT, house_state: HOUSED } });
     await tick();
@@ -327,7 +333,7 @@ const scenarios = {
 
   // 글 쓰는 창의 키: 버튼 위 Enter는 그 버튼만, 한글 조합 중 Enter는 글자 확정, Esc는 닫기
   async formKeys([html, submitCmd, closeCmd]) {
-    const replies = { letter_state: { name: "친구", max: 80 }, postit_max: 80, name_state: { target: "me", current: "", fallback: "친구", max: 20 }, code_state: { code: "ABCD-1234", connected: true, enabled: true } };
+    const replies = { letter_state: { name: "친구", max: 80 }, postit_max: 80, name_state: { target: "me", current: "", fallback: "친구", max: 20 }, code_state: { code: "ABCD-1234", connected: true, enabled: true }, link_state: { name: "친구", code: "WXYZ-2345", phase: "ready", note: "" } };
     const w = openWindow(html, { replies });
     await tick();
     w.byId("input").value = "ABCD-1234";
@@ -348,6 +354,38 @@ const scenarios = {
     const w = openWindow("book.html", { replies: { book_state: { sections: [], collected: 0, total: 0, shiny: 0 } } });
     await tick();
     return { f5: w.key("F5", "BODY"), menu: w.menu(), escape: w.key("Escape", "BODY") };
+  },
+
+  // 📱 코드가 맞은 뒤 "본인의 PC가 맞습니까?": 확인은 저쪽을 기다리고, 취소·Esc는 취소한다
+  async linkConfirm() {
+    const w = openWindow("link.html", { replies: { link_state: { name: "민수", code: "", phase: "confirm", note: "" } } });
+    await tick();
+    const look = () => ({
+      title: w.byId("title").textContent,
+      ask: w.byId("ask").hidden ? null : w.byId("ask").textContent,
+      who: w.byId("who").hidden ? null : w.byId("who").textContent,
+      ok: w.byId("ok").hidden ? null : w.byId("ok").textContent,
+      okDisabled: w.byId("ok").disabled,
+      cancel: w.byId("cancel").textContent,
+      input: !w.byId("input").hidden,
+      code: !w.byId("mineBox").hidden,
+      note: w.byId("note").textContent,
+    });
+    const confirm = look();
+    w.byId("ok").fire("click");
+    await tick();
+    const yes = w.invoked.filter((c) => c.cmd === "link_confirm").map((c) => c.args);
+    w.emit("link-state", { name: "민수", code: "", phase: "confirmed", note: "저쪽 컴퓨터에서도 확인을 눌러 주세요" });
+    const waiting = look();
+    w.byId("ok").fire("click");
+    w.byId("cancel").fire("click");
+    await tick();
+    const after = w.invoked.filter((c) => c.cmd === "link_confirm").map((c) => c.args);
+    w.key("Escape", "BODY");
+    await tick();
+    w.emit("link-state", { name: "민수", code: "", phase: "cancelled", note: "연결을 취소했어요" });
+    const cancelled = look();
+    return { confirm, yes, waiting, after, closed: w.calls("link_close"), cancelled };
   },
 
   // 새 코드를 기다리는 동안 복사하면 이미 못 쓰게 된 옛 코드가 복사된다

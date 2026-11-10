@@ -51,6 +51,9 @@ pub struct Config {
     /// 🎁 주운 선물 (도감). 잘못된 줄은 건너뛴다
     #[serde(default, skip_serializing_if = "GiftBook::is_empty")]
     pub gifts: GiftBook,
+    /// 💩 똥피하기 내 최고 기록 (피한 똥 수). 모르는 값이면 0
+    #[serde(default, skip_serializing_if = "is_zero", deserialize_with = "lenient")]
+    pub dodge_best: u32,
     /// 📏 펫 크기 (%). 없으면 100
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
     pet_size_pct: Option<u32>,
@@ -152,6 +155,36 @@ pub struct Friend {
     /// 내가 붙인 별명 (그 친구 동물의 이름표·메뉴에 이름 대신). 없으면 친구가 정한 이름
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nickname: Option<String>,
+    /// 💩 똥피하기 그 친구의 최고 기록 (친구가 알려 준 것 — 받은 적 없으면 None)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+    pub dodge_best: Option<u32>,
+    /// 📱 내 다른 컴퓨터: 연결 코드가 맞아 둘이 나눠 가진 비밀. 연결될 때마다 서로 이 비밀을 증명해야 친구 목록을 나눈다.
+    /// 컴퓨터는 둘까지라 이 값이 있는 친구는 하나뿐이다 (net이 정한다). 깨진 값은 연결 없음으로 읽는다
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+    pub device_secret: Option<DeviceSecret>,
+    /// 이 친구 id가 자기 다른 컴퓨터라고 소개했다 (그 친구를 지우면 같이 지워진다)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+    pub via: Option<String>,
+    /// 짝맞추기 없이 (내 다른 컴퓨터나 친구의 소개로) 들어왔고, 아직 상대가 나를 아는지 못 봤다
+    #[serde(default, skip_serializing_if = "std::ops::Not::not", deserialize_with = "lenient")]
+    pub pending: bool,
+    /// 확인 못 한 채로 들어온 때 (유닉스 초) — 일주일이 지나도 확인 못 하면 net이 지운다. 껐다 켜도 이어 센다
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+    pub pending_since: Option<u64>,
+}
+
+/// 📱 내 다른 컴퓨터와 나눈 비밀 (파일에는 hex 64자). Debug로 찍어도 값은 나오지 않는다
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceSecret(#[serde(with = "hex32")] pub [u8; 32]);
+
+impl std::fmt::Debug for DeviceSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceSecret(..)")
+    }
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Friend {
@@ -185,7 +218,40 @@ enum SideDef {
     Down,
 }
 
+/// 이름이 바뀐 동물 (예전 이름, 지금 이름) — 불러올 때 옮긴다 (retire_pets)
+pub const RENAMED_PETS: [(&str, &str); 1] = [("beaver", "bear")];
+/// 더 이상 없는 동물 (v0.5.5: 곰·꿀벌·강아지) — 고른 동물이면 RETIRED_TO로 바꾸고, 키운 기록은 RETIRED_TO에 넘긴다
+pub const RETIRED_PETS: [&str; 3] = ["bear", "bee", "dog"];
+pub const RETIRED_TO: &str = "cat";
+
+/// 돌보기 기록 중 더 많이 큰 쪽 (단계, 같으면 체력)
+fn further_grown(a: &Care, b: &Care) -> bool {
+    let rank = |c: &Care| crate::care::Stage::ALL.iter().position(|s| *s == c.stage).unwrap_or(0);
+    (rank(a), a.stamina) > (rank(b), b.stamina)
+}
+
 impl Config {
+    /// 이름이 바뀌었거나 없어진 동물을 지금 동물로 옮긴다 (`load`가 부른다). 없어진 동물이 골라져 있으면 고양이로 바꾸고,
+    /// 그 동물들의 기록 중 가장 많이 큰 것을 (고양이 기록보다 더 컸을 때만) 고양이에게 넘긴다 — 키운 만큼은 잃지 않는다.
+    pub fn retire_pets(&mut self) {
+        for (from, to) in RENAMED_PETS {
+            self.rename_pet(from, to);
+        }
+        for gone in RETIRED_PETS {
+            if self.pet.as_deref() == Some(gone) {
+                self.pet = Some(RETIRED_TO.to_string());
+            }
+            if let Some(care) = self.care.remove(gone) {
+                match self.care.get(RETIRED_TO) {
+                    Some(have) if !further_grown(&care, have) => {}
+                    _ => {
+                        self.care.insert(RETIRED_TO.to_string(), care);
+                    }
+                }
+            }
+        }
+    }
+
     /// 없어진 동물을 다른 동물로 옮긴다 (선택과 돌보기 상태). 대상에 이미 기록이 있으면 그쪽을 남긴다.
     pub fn rename_pet(&mut self, from: &str, to: &str) {
         if self.pet.as_deref() == Some(from) {
@@ -234,7 +300,7 @@ impl Config {
             }
             None => {
                 let side = self.next_side();
-                self.friends.push(Friend { id: id.to_string(), name: name.to_string(), public_key, side, nickname: None });
+                self.friends.push(Friend { id: id.to_string(), name: name.to_string(), public_key, side, nickname: None, dodge_best: None, device_secret: None, via: None, pending: false, pending_since: None });
                 changed = true;
             }
         }
@@ -291,20 +357,137 @@ impl Config {
         self.owner_name.as_deref().and_then(sanitize_name).unwrap_or_else(|| DEFAULT_OWNER_NAME.to_string())
     }
 
+    /// 💩 똥피하기 한 판 끝: 최고 기록이면 남기고 true
+    pub fn record_dodge(&mut self, score: u32) -> bool {
+        let score = score.min(crate::dodge::MAX_SCORE);
+        if score <= self.dodge_best {
+            return false;
+        }
+        self.dodge_best = score;
+        true
+    }
+
+    /// 친구가 알려 준 똥피하기 최고 기록. 바뀌었으면 true (모르는 친구는 무시)
+    pub fn set_friend_dodge_best(&mut self, id: &str, score: u32) -> bool {
+        let score = Some(score.min(crate::dodge::MAX_SCORE));
+        match self.friends.iter_mut().find(|f| f.id == id) {
+            Some(f) if f.dodge_best != score => {
+                f.dodge_best = score;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 📱 친구가 어디서 왔는지(소개한 친구, 확인 전)를 맞춘다 (net이 아는 대로). 바뀌었으면 true (모르는 친구는 무시)
+    pub fn set_friend_links(&mut self, id: &str, via: Option<&str>, pending: bool) -> bool {
+        let changed = match self.friends.iter_mut().find(|f| f.id == id) {
+            Some(f) if (f.via.as_deref(), f.pending) != (via, pending) => {
+                f.via = via.map(str::to_string);
+                f.pending = pending;
+                true
+            }
+            _ => false,
+        };
+        // 소개받은 컴퓨터는 그 사람이 있는 끝에
+        if let Some(side) = via.and_then(|v| self.friend(v)).map(|f| f.side).filter(|_| changed) {
+            self.set_friend_side(id, side);
+        }
+        changed
+    }
+
+    /// 📱 친구 목록을 linked::Member로 (connected = 연결된 때, 클수록 나중)
+    fn members(&self, connected: impl Fn(&str) -> Option<f64>) -> Vec<crate::linked::Member<'_>> {
+        self.friends.iter().map(|f| crate::linked::Member { id: &f.id, via: f.via.as_deref(), connected: connected(&f.id) }).collect()
+    }
+
+    /// 📱 이 친구가 속한 사람(처음 친구가 된 컴퓨터)의 id — 친구가 소개한 그 친구의 다른 컴퓨터면 그 친구
+    pub fn person_id<'a>(&'a self, id: &'a str) -> &'a str {
+        crate::linked::person_id(&self.members(|_| None), id)
+    }
+
+    /// 📱 그 사람의 보일 이름 (별명, 없으면 처음 친구가 정한 이름) — 다른 컴퓨터에서 온 동물도 같은 이름표
+    pub fn person_name(&self, id: &str) -> Option<&str> {
+        self.friend(self.person_id(id)).map(Friend::shown_name)
+    }
+
+    /// 📱 친구를 사람으로 묶는다 (메뉴 한 줄씩). connected = 연결된 때 (None = 연결 안 됨)
+    pub fn people(&self, connected: impl Fn(&str) -> Option<f64>) -> Vec<crate::linked::Person> {
+        crate::linked::group(&self.members(connected))
+    }
+
+    /// 📱 a와 b는 한 사람의 서로 다른 컴퓨터다
+    pub fn same_person(&self, a: &str, b: &str) -> bool {
+        a != b && self.friend(a).is_some() && self.friend(b).is_some() && self.person_id(a) == self.person_id(b)
+    }
+
+    /// 📱 친구 id의 동물에게 보낼 말을 실을 링크: 그 id가 연결돼 있으면 그대로, 아니면 그 사람의 연결된 다른 컴퓨터
+    /// (대기 중인 컴퓨터의 동물은 노는 컴퓨터를 거쳐 왔다). 아무도 없으면 그 id
+    pub fn reach<'a>(&'a self, id: &'a str, connected: impl Fn(&str) -> bool) -> &'a str {
+        if connected(id) {
+            return id;
+        }
+        let person = self.person_id(id);
+        self.friends.iter().map(|f| f.id.as_str()).find(|f| *f != id && self.person_id(f) == person && connected(f)).unwrap_or(id)
+    }
+
+    /// 💩 똥피하기 순위에 넣을 친구: 사람마다 한 줄, 그 사람 컴퓨터들 중 가장 좋은 기록
+    pub fn dodge_friends(&self) -> Vec<(String, u32)> {
+        self.people(|_| None)
+            .iter()
+            .filter_map(|p| {
+                let best = p.members.iter().filter_map(|id| self.friend(id)?.dodge_best).max()?;
+                Some((self.person_name(&p.id)?.to_string(), best))
+            })
+            .collect()
+    }
+
+    /// 📱 내 다른 컴퓨터와 나눈 비밀을 맞춘다 (net이 아는 대로, None = 연결 안 됨). 바뀌었으면 true (모르는 친구는 무시)
+    pub fn set_friend_device_secret(&mut self, id: &str, secret: Option<[u8; 32]>) -> bool {
+        let secret = secret.map(DeviceSecret);
+        match self.friends.iter_mut().find(|f| f.id == id) {
+            Some(f) if f.device_secret != secret => {
+                f.device_secret = secret;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 📱 연결된 내 다른 컴퓨터 (id, 비밀) — 여럿 적혀 있으면 (손으로 고친 파일) 처음 것만
+    pub fn linked_device(&self) -> Option<(&str, [u8; 32])> {
+        self.friends.iter().find_map(|f| Some((f.id.as_str(), f.device_secret?.0)))
+    }
+
+    /// 확인 못 한 친구가 들어온 때를 맞춘다 (net이 아는 대로). 바뀌었으면 true (모르는 친구는 무시)
+    pub fn set_friend_pending_since(&mut self, id: &str, since: Option<u64>) -> bool {
+        match self.friends.iter_mut().find(|f| f.id == id) {
+            Some(f) if f.pending_since != since => {
+                f.pending_since = since;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn remove_friend(&mut self, id: &str) -> bool {
         let before = self.friends.len();
         self.friends.retain(|f| f.id != id);
         self.friends.len() != before
     }
 
+    /// 친구가 붙은 끝 — 📱 한 사람의 컴퓨터 둘은 같은 끝에
     pub fn set_friend_side(&mut self, id: &str, side: Side) -> bool {
-        match self.friends.iter_mut().find(|f| f.id == id) {
-            Some(f) if f.side != side => {
+        let person = self.person_id(id).to_string();
+        let members: Vec<String> = self.people(|_| None).into_iter().find(|p| p.id == person).map_or_else(|| vec![id.to_string()], |p| p.members);
+        let mut changed = false;
+        for f in self.friends.iter_mut().filter(|f| members.contains(&f.id)) {
+            if f.side != side {
                 f.side = side;
-                true
+                changed = true;
             }
-            _ => false,
         }
+        changed
     }
 
     /// 지금 연결된(connected) 친구가 있는 화면 끝
@@ -405,7 +588,7 @@ mod hex32 {
 pub fn load(dir: &Path) -> Config {
     let path = dir.join(FILE);
     let parsed = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| e.to_string()),
+        Ok(text) => serde_json::from_str::<Config>(&text).map_err(|e| e.to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Config::default(),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(e.to_string()),
         // 권한·잠금 등: 파일은 멀쩡할 수 있다. 기본값으로 돌되 덮어쓰지 않는다
@@ -415,7 +598,10 @@ pub fn load(dir: &Path) -> Config {
         }
     };
     match parsed {
-        Ok(c) => c,
+        Ok(mut c) => {
+            c.retire_pets();
+            c
+        }
         Err(e) => {
             let bak = dir.join(BAK_FILE);
             match std::fs::copy(&path, &bak) {
@@ -616,10 +802,95 @@ mod tests {
     fn care_per_pet_roundtrips() {
         use crate::care::{Care, Stage};
         let d = temp_dir("care");
-        let mut c = Config { pet: Some("dog".into()), ..Config::default() };
-        c.care.insert("dog".into(), Care { stage: Stage::Child, stamina: 12.0, fullness: 0.3, locked: true });
+        let mut c = Config { pet: Some("rabbit".into()), ..Config::default() };
+        c.care.insert("rabbit".into(), Care { stage: Stage::Child, stamina: 12.0, fullness: 0.3, locked: true });
         save(&d, &c).unwrap();
         assert_eq!(load(&d), c);
+    }
+
+    // ---- 없어진 동물 (곰·꿀벌·강아지) → 고양이, 키운 만큼은 그대로 ----
+
+    fn cfg_with(pet: &str, care: &[(&str, crate::care::Care)]) -> Config {
+        let mut c = Config { pet: Some(pet.into()), owner_name: Some("민지".into()), ..Config::default() };
+        c.care.extend(care.iter().map(|(id, cr)| (id.to_string(), cr.clone())));
+        c
+    }
+
+    #[test]
+    fn retired_pets_move_to_the_cat_with_their_growth() {
+        use crate::care::{Care, Stage};
+        let grown = Care { stage: Stage::Teenager, stamina: 40.0, fullness: 0.4, locked: true };
+        for gone in ["bear", "bee", "dog"] {
+            let mut c = cfg_with(gone, &[(gone, grown.clone())]);
+            c.retire_pets();
+            assert_eq!(c.pet.as_deref(), Some(RETIRED_TO), "{gone}");
+            assert_eq!(c.care.get("cat"), Some(&grown), "{gone}: growth is carried over");
+            assert!(!c.care.contains_key(gone), "{gone}");
+            assert_eq!(c.owner_name.as_deref(), Some("민지"), "the rest of the config is kept");
+        }
+        assert_eq!(RETIRED_TO, "cat");
+    }
+
+    #[test]
+    fn retired_pets_keep_the_furthest_grown_care() {
+        use crate::care::{Care, Stage};
+        let baby = Care { stage: Stage::Baby, stamina: 20.0, ..Care::default() };
+        let child = Care { stage: Stage::Child, stamina: 5.0, ..Care::default() };
+        let child_more = Care { stage: Stage::Child, stamina: 30.0, ..Care::default() };
+        let adult = Care { stage: Stage::Adult, ..Care::default() };
+        // 고양이가 더 어리면 없어진 동물의 기록을 받는다
+        let mut c = cfg_with("dog", &[("dog", child.clone()), ("cat", baby.clone())]);
+        c.retire_pets();
+        assert_eq!((c.pet.as_deref(), c.care.get("cat")), (Some("cat"), Some(&child)));
+        // 고양이가 더 컸으면 고양이 기록을 남긴다
+        let mut c = cfg_with("bear", &[("bear", child.clone()), ("cat", adult.clone())]);
+        c.retire_pets();
+        assert_eq!(c.care.get("cat"), Some(&adult));
+        // 같은 단계면 체력이 더 많은 쪽 · 여러 마리면 가장 많이 큰 하나
+        let mut c = cfg_with("rabbit", &[("bee", child_more.clone()), ("dog", child.clone()), ("cat", child.clone())]);
+        c.retire_pets();
+        assert_eq!(c.pet.as_deref(), Some("rabbit"), "a remaining pet stays selected");
+        assert_eq!(c.care.get("cat"), Some(&child_more));
+        assert!(!c.care.contains_key("bee") && !c.care.contains_key("dog"));
+        assert_eq!(c.care.len(), 1);
+    }
+
+    #[test]
+    fn retiring_leaves_remaining_pets_alone() {
+        use crate::care::{Care, Stage};
+        let teen = Care { stage: Stage::Teenager, ..Care::default() };
+        let mut c = cfg_with("rabbit", &[("rabbit", teen.clone())]);
+        let before = serde_json::to_string(&c).unwrap();
+        c.retire_pets();
+        assert_eq!(serde_json::to_string(&c).unwrap(), before);
+        let mut none = Config::default();
+        none.retire_pets();
+        assert_eq!(none, Config::default(), "a new install keeps no pet chosen");
+    }
+
+    #[test]
+    fn a_very_old_beaver_becomes_a_cat_too() {
+        use crate::care::{Care, Stage};
+        let kinder = Care { stage: Stage::Kinder, ..Care::default() };
+        let mut c = cfg_with("beaver", &[("beaver", kinder.clone())]);
+        c.retire_pets();
+        assert_eq!((c.pet.as_deref(), c.care.get("cat")), (Some("cat"), Some(&kinder)));
+        assert_eq!(c.care.len(), 1);
+    }
+
+    #[test]
+    fn loading_an_old_config_retires_bear_bee_and_dog() {
+        let d = temp_dir("retired");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("config.json"),
+            r#"{"pet": "bee", "owner_name": "민지", "care": {"bee": {"stage": "child", "stamina": 12.0, "fullness": 0.5, "locked": false}}}"#,
+        )
+        .unwrap();
+        let c = load(&d);
+        assert_eq!(c.pet.as_deref(), Some("cat"));
+        assert_eq!(c.care.get("cat").map(|c| (c.stage, c.stamina)), Some((crate::care::Stage::Child, 12.0)));
+        assert_eq!(c.owner_name.as_deref(), Some("민지"));
     }
 
     #[test]
@@ -628,9 +899,9 @@ mod tests {
         let child = Care { stage: Stage::Child, ..Care::default() };
         let mut c = Config { pet: Some("beaver".into()), ..Config::default() };
         c.care.insert("beaver".into(), child.clone());
-        c.rename_pet("beaver", "bear");
-        assert_eq!(c.pet.as_deref(), Some("bear"));
-        assert_eq!(c.care.get("bear"), Some(&child));
+        c.rename_pet("beaver", "rabbit");
+        assert_eq!(c.pet.as_deref(), Some("rabbit"));
+        assert_eq!(c.care.get("rabbit"), Some(&child));
         assert!(!c.care.contains_key("beaver"));
     }
 
@@ -640,10 +911,10 @@ mod tests {
         let adult = Care { stage: Stage::Adult, ..Care::default() };
         let mut c = Config { pet: Some("cat".into()), ..Config::default() };
         c.care.insert("beaver".into(), Care::default());
-        c.care.insert("bear".into(), adult.clone());
-        c.rename_pet("beaver", "bear");
+        c.care.insert("rabbit".into(), adult.clone());
+        c.rename_pet("beaver", "rabbit");
         assert_eq!(c.pet.as_deref(), Some("cat"));
-        assert_eq!(c.care.get("bear"), Some(&adult));
+        assert_eq!(c.care.get("rabbit"), Some(&adult));
         assert!(!c.care.contains_key("beaver"));
     }
 
@@ -811,6 +1082,60 @@ mod tests {
         assert!(c.remove_friend("a") && !c.remove_friend("a"));
     }
 
+    /// 친구 X(왼쪽), X가 소개한 X의 다른 컴퓨터 x2, 다른 친구 y
+    fn with_two_computers() -> Config {
+        let mut c = Config::default();
+        c.upsert_friend("x", "Xavier", key(1));
+        c.upsert_friend("y", "Yuna", key(2));
+        c.set_friend_side("x", Side::Left);
+        c.upsert_friend("x2", "x on the laptop", key(3));
+        c.set_friend_links("x2", Some("x"), false);
+        c
+    }
+
+    #[test]
+    fn a_friends_other_computer_is_the_same_person_with_the_same_name_and_side() {
+        let mut c = with_two_computers();
+        assert_eq!(c.friend("x2").unwrap().side, Side::Left, "it sits where its person sits");
+        assert_eq!(c.person_id("x2"), "x");
+        assert_eq!(c.person_id("y"), "y");
+        assert_eq!(c.person_name("x2"), Some("Xavier"));
+        assert_eq!(c.person_name("nobody"), None);
+        c.set_friend_nickname("x", "자비");
+        assert_eq!(c.person_name("x2"), Some("자비"), "the nickname is for the person");
+        // 화면 끝은 둘 다
+        assert!(c.set_friend_side("x", Side::Up));
+        assert_eq!((c.friend("x").unwrap().side, c.friend("x2").unwrap().side), (Side::Up, Side::Up));
+        assert!(c.set_friend_side("x2", Side::Down));
+        assert_eq!((c.friend("x").unwrap().side, c.friend("x2").unwrap().side), (Side::Down, Side::Down));
+        assert_eq!(c.friend("y").unwrap().side, Side::Left, "others stay");
+        let people = c.people(|id| (id == "x2").then_some(1.0));
+        assert_eq!(people.len(), 2);
+        assert_eq!((people[0].id.as_str(), people[0].target.as_str(), people[0].connected), ("x", "x2", true));
+    }
+
+    #[test]
+    fn messages_for_a_persons_pet_go_to_whichever_of_their_computers_is_connected() {
+        let c = with_two_computers();
+        assert_eq!(c.reach("x2", |id| id == "x2"), "x2");
+        assert_eq!(c.reach("x2", |id| id == "x"), "x", "x2 plays elsewhere: its pet is reached through x");
+        assert_eq!(c.reach("x", |id| id == "x2"), "x2");
+        assert_eq!(c.reach("x", |_| false), "x");
+        assert_eq!(c.reach("y", |id| id == "x"), "y", "never someone else");
+        // 한 사람이 보낸 다른 컴퓨터의 동물만 (소개한 쪽이든 소개받은 쪽이든)
+        assert!(c.same_person("x", "x2") && c.same_person("x2", "x"));
+        assert!(!c.same_person("x", "y") && !c.same_person("x", "x") && !c.same_person("x", "nobody"));
+    }
+
+    #[test]
+    fn the_dodge_ranking_has_one_line_per_person_with_their_best() {
+        let mut c = with_two_computers();
+        c.set_friend_dodge_best("x", 10);
+        c.set_friend_dodge_best("x2", 30);
+        c.set_friend_dodge_best("y", 20);
+        assert_eq!(c.dodge_friends(), vec![("Xavier".to_string(), 30), ("Yuna".to_string(), 20)]);
+    }
+
     #[test]
     fn exit_edges_need_a_connected_friend_on_that_side() {
         let mut c = Config::default();
@@ -871,7 +1196,7 @@ mod tests {
     fn a_config_that_cannot_be_read_is_never_overwritten() {
         use std::os::unix::fs::PermissionsExt;
         let d = temp_dir("unreadable");
-        if !unreadable(&d, "config.json", "{\"pet\":\"dog\"}") {
+        if !unreadable(&d, "config.json", "{\"pet\":\"rabbit\"}") {
             return;
         }
         let c = load(&d);
@@ -879,7 +1204,7 @@ mod tests {
         assert!(c.keep_file, "this run must not write over the friends it could not read");
         assert!(save(&d, &c).is_err());
         std::fs::set_permissions(d.join("config.json"), std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(load(&d).pet.as_deref(), Some("dog"));
+        assert_eq!(load(&d).pet.as_deref(), Some("rabbit"));
     }
 
     #[test]
@@ -928,7 +1253,7 @@ mod tests {
     fn save_is_atomic_and_leaves_no_temp_file() {
         let d = temp_dir("atomic");
         save(&d, &Config { pet: Some("cat".into()), ..Config::default() }).unwrap();
-        let c = Config { pet: Some("dog".into()), ..Config::default() };
+        let c = Config { pet: Some("rabbit".into()), ..Config::default() };
         save(&d, &c).unwrap();
         assert!(!d.join("config.json.tmp").exists());
         assert_eq!(load(&d), c);
@@ -959,7 +1284,7 @@ mod tests {
         let bad: Config = serde_json::from_str(r#"{"pet":"cat","feed_mode":"teleport"}"#).unwrap();
         assert_eq!((bad.pet.as_deref(), bad.feed_mode), (Some("cat"), FeedMode::Hand));
         let dir = temp_dir("feedmode");
-        let c = Config { pet: Some("dog".into()), feed_mode: FeedMode::Auto, ..Config::default() };
+        let c = Config { pet: Some("rabbit".into()), feed_mode: FeedMode::Auto, ..Config::default() };
         save(&dir, &c).unwrap();
         assert_eq!(load(&dir).feed_mode, FeedMode::Auto);
     }
@@ -1078,6 +1403,28 @@ mod tests {
     }
 
     #[test]
+    fn dodge_records_keep_the_best_and_survive_a_roundtrip() {
+        let mut c = Config::default();
+        assert!(c.record_dodge(12));
+        assert!(!c.record_dodge(7), "lower score");
+        assert!(!c.record_dodge(12), "same score");
+        assert_eq!(c.dodge_best, 12);
+        c.upsert_friend("a", "Ann", key(1));
+        assert!(c.set_friend_dodge_best("a", 30));
+        assert!(!c.set_friend_dodge_best("a", 30));
+        assert!(!c.set_friend_dodge_best("nobody", 3));
+        // 이름이 바뀌어도 기록은 남는다
+        c.upsert_friend("a", "Annie", key(1));
+        assert_eq!(c.friend("a").unwrap().dodge_best, Some(30));
+        let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!((back.dodge_best, back.friends[0].dodge_best), (12, Some(30)));
+        // 기록이 없으면 저장 파일에도 없고, 잘못된 값은 0 / None
+        assert!(!serde_json::to_string(&Config::default()).unwrap().contains("dodge"));
+        let bad: Config = serde_json::from_str(r#"{"pet":"cat","dodge_best":"lots"}"#).unwrap();
+        assert_eq!(bad.dodge_best, 0);
+    }
+
+    #[test]
     fn friend_nickname_takes_precedence_and_clearing_falls_back() {
         let mut c = Config::default();
         c.upsert_friend("a", "Ann", key(1));
@@ -1183,5 +1530,74 @@ mod tests {
         c.set_friend_nickname("a", "");
         save(&d, &c).unwrap();
         assert!(!std::fs::read_to_string(d.join("config.json")).unwrap().contains("nickname"));
+    }
+
+    #[test]
+    fn linked_device_secrets_roundtrip_and_old_friends_still_load() {
+        let d = temp_dir("devices");
+        let mut c = Config { install_id: Some("me".into()), ..Config::default() };
+        c.upsert_friend("home", "Ann", key(1));
+        c.upsert_friend("pal", "Bo", key(2));
+        c.upsert_friend("pal2", "Bo", key(3));
+        assert!(c.set_friend_device_secret("home", Some([7; 32])));
+        assert!(!c.set_friend_device_secret("home", Some([7; 32])), "unchanged");
+        assert!(!c.set_friend_device_secret("nobody", Some([7; 32])));
+        assert!(c.set_friend_links("pal2", Some("pal"), true));
+        assert!(!c.set_friend_links("pal2", Some("pal"), true), "unchanged");
+        assert!(!c.set_friend_links("nobody", None, false));
+        save(&d, &c).unwrap();
+        let text = std::fs::read_to_string(d.join("config.json")).unwrap();
+        // 연결 안 된 친구는 예전과 같은 모양으로 저장된다
+        assert_eq!(text.matches("\"device_secret\"").count(), 1, "{text}");
+        assert_eq!(text.matches("\"pending\"").count(), 1, "{text}");
+        let back = load(&d);
+        assert_eq!(back, c);
+        let pal2 = back.friend("pal2").unwrap();
+        assert_eq!((pal2.device_secret, pal2.via.as_deref(), pal2.pending), (None, Some("pal"), true));
+        assert_eq!(back.friend("home").unwrap().device_secret, Some(DeviceSecret([7; 32])));
+        assert_eq!(back.linked_device(), Some(("home", [7; 32])));
+        // 비밀은 Debug로도 찍히지 않는다
+        assert!(!format!("{back:?}").contains("7, 7"), "the secret is never printed");
+        assert!(c.set_friend_device_secret("home", None), "unlinked");
+        assert_eq!(c.linked_device(), None);
+        // 예전 친구 항목 (예전 판의 "device": true 표시도): 연결 없음
+        let old = format!(r#"{{"friends": [{{"id": "a", "name": "A", "public_key": "{}", "side": "left", "device": true}}]}}"#, "01".repeat(32));
+        let old: Config = serde_json::from_str(&old).unwrap();
+        let a = old.friend("a").unwrap();
+        assert_eq!((a.device_secret, a.via.as_deref(), a.pending), (None, None, false));
+    }
+
+    #[test]
+    fn bad_device_values_are_dropped_not_the_friend() {
+        let k = "01".repeat(32);
+        for secret in [r#""yes""#, r#""0102""#, "5", &format!(r#""{}""#, "zz".repeat(32))] {
+            let text = format!(r#"{{"friends": [{{"id": "a", "name": "A", "public_key": "{k}", "side": "left", "device_secret": {secret}, "via": 5, "pending": []}}]}}"#);
+            let c: Config = serde_json::from_str(&text).unwrap();
+            let a = c.friend("a").expect("the friend stays");
+            assert_eq!((a.device_secret, a.via.as_deref(), a.pending), (None, None, false), "{secret}");
+        }
+    }
+
+    #[test]
+    fn when_an_unconfirmed_friend_came_in_is_kept_and_old_or_bad_values_load_as_unknown() {
+        let d = temp_dir("pending-since");
+        let mut c = Config { install_id: Some("me".into()), ..Config::default() };
+        c.upsert_friend("pal2", "Bo", key(3));
+        c.upsert_friend("pal", "Bo", key(2));
+        assert!(c.set_friend_pending_since("pal2", Some(1_700_000_000)));
+        assert!(!c.set_friend_pending_since("pal2", Some(1_700_000_000)), "unchanged");
+        assert!(!c.set_friend_pending_since("nobody", Some(1)));
+        save(&d, &c).unwrap();
+        let text = std::fs::read_to_string(d.join("config.json")).unwrap();
+        assert_eq!(text.matches("\"pending_since\"").count(), 1, "{text}");
+        let back = load(&d);
+        assert_eq!(back, c);
+        assert_eq!(back.friend("pal2").unwrap().pending_since, Some(1_700_000_000));
+        assert_eq!(back.friend("pal").unwrap().pending_since, None);
+        assert!(c.set_friend_pending_since("pal2", None), "confirmed");
+        let k = "01".repeat(32);
+        let text = format!(r#"{{"friends": [{{"id": "a", "name": "A", "public_key": "{k}", "side": "left", "pending": true, "pending_since": "soon"}}]}}"#);
+        let c: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(c.friend("a").expect("the friend stays").pending_since, None);
     }
 }

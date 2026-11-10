@@ -4,12 +4,18 @@
 use serde::{Deserialize, Serialize};
 
 /// Protocol version carried in announcements and `hello`. 2 = knows the
-/// `ladder_*` messages (v0.5.0). Older versions send 1 and close a link on any
-/// message `type` they do not know, so features with new message types check
-/// the peer's version first (`Net::peer_version`).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// `ladder_*` messages (v0.5.0). 3 = knows `device_friends`, `my_devices` and
+/// the `device_*` code-linking messages (linked devices, v0.5.3). Older versions close a link on any message `type`
+/// they do not know, so features with new message types check the peer's
+/// version first (`Net::peer_version`).
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Lowest peer version that may be sent `LadderMsg`s.
 pub const LADDER_MIN_VERSION: u32 = 2;
+/// Lowest peer version that may be sent `device_friends`, `my_devices` and `device_*`.
+pub const DEVICES_MIN_VERSION: u32 = 3;
+/// Most devices one friend introduces (`my_devices`), in one message and in
+/// all: a person links at most two computers, so a friend has one other.
+pub const MAX_DEVICES: usize = 1;
 /// App tag carried in announcements so unrelated UDP traffic is ignored.
 pub const APP_TAG: &str = "screenpet";
 /// Largest frame on a link (a Noise message is at most 65535 bytes).
@@ -111,6 +117,64 @@ pub struct Toss {
     /// receiver limits it; older versions ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
     pub scale: Option<f64>,
+    /// A coloured poop ("pink", "rainbow"), sent as kind "poop" so older
+    /// versions get a plain one. The receiver's app checks the name.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+    pub look: Option<String>,
+}
+
+/// A list whose malformed entries are skipped (never the whole message);
+/// anything but an array reads as empty. At most 256 entries are kept.
+fn lenient_list<'de, T: serde::de::DeserializeOwned, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<T>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let items = match v {
+        serde_json::Value::Array(items) => items,
+        _ => Vec::new(),
+    };
+    Ok(items.into_iter().take(256).filter_map(|v| serde_json::from_value(v).ok()).collect())
+}
+
+/// A string that may be missing or something else (read as empty).
+fn lenient_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_bool().unwrap_or(false))
+}
+
+fn lenient_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_str().map(str::to_string).unwrap_or_default())
+}
+
+/// One of my friends, as shared with my other computer (`device_friends`).
+/// `key` = the friend's static public key (64 hex digits). `name` and `side`
+/// are only first values for the receiver's list (it checks them).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireFriend {
+    pub id: String,
+    pub key: String,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+    pub side: Option<String>,
+}
+
+/// 📱 One pet's care as my two computers share it (`device_state`): the
+/// receiver checks the shape (`devices::clean_state`), the app the values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireCare {
+    pub pet: String,
+    pub stage: String,
+    pub stamina: f64,
+    pub fullness: f64,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub locked: bool,
+}
+
+/// One of my other computers, as introduced to a friend (`my_devices`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireDevice {
+    pub id: String,
+    pub key: String,
 }
 
 fn left_side() -> Side {
@@ -165,6 +229,13 @@ pub enum Visit {
         /// receiver limits it; older versions ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
         boost: Option<f64>,
+        /// 📱 The pet belongs to the sender's other computer (this install id),
+        /// which may be on standby: the sender carries it (only to
+        /// `DEVICES_MIN_VERSION` peers). The receiver takes it only if it knows
+        /// both ids as one person's computers, and answers through whichever is
+        /// connected.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+        of: Option<String>,
     },
     /// The guest left the receiver's friend's screen. `next: None` = it went
     /// home (also what older versions send). `next: Some(id)` = it walked out
@@ -244,6 +315,92 @@ pub enum Control {
         /// An object thrown over to the receiver's screen.
         #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
         toss: Option<Toss>,
+    },
+    /// My friends, sent to my linked computer once it proved our secret on
+    /// this link (only to `DEVICES_MIN_VERSION` peers). The receiver takes it
+    /// only from a link where the proof checked out, and only adds friends it
+    /// does not know. `want` = please send yours back.
+    DeviceFriends {
+        #[serde(default, deserialize_with = "lenient_list")]
+        friends: Vec<WireFriend>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        want: bool,
+    },
+    /// My other computer (at most `MAX_DEVICES`), introduced to a friend that
+    /// is not one of them (only to `DEVICES_MIN_VERSION` peers). The friend adds
+    /// them as friends that leave together with me.
+    MyDevices {
+        #[serde(default, deserialize_with = "lenient_list")]
+        devices: Vec<WireDevice>,
+    },
+    /// 📱 Linking with a code (all `device_*` messages only to
+    /// `DEVICES_MIN_VERSION` peers). The enterer typed the code the receiver
+    /// is showing for it: `nonce` = its fresh 32-byte nonce nb (hex). The code
+    /// itself never goes on the wire.
+    DeviceCode { nonce: String },
+    /// The code holder's fresh nonce na, only if it holds an unexpired code
+    /// for the sender (`device_no` otherwise).
+    DeviceCodeNonce { nonce: String },
+    /// The enterer's proof that it knows the code K = BLAKE2s(label || code):
+    /// BLAKE2s(label || "enter" || K || nb || na || enterer key || holder key).
+    DeviceCodeProof { proof: String },
+    /// The holder checked that proof and now proves the code too (it never
+    /// proves first, so a wrong guess learns nothing):
+    /// BLAKE2s(label || "hold" || K || nb || na || holder key || enterer key).
+    /// Both then store S = BLAKE2s(label || K || holder key || enterer key || na || nb).
+    DeviceCodeOk { proof: String },
+    /// The code did not link: `reason` = "wrong" (`left` tries remain),
+    /// "locked" (too many wrong tries: the code is gone), "none" (no code for
+    /// you, expired or used), "taken" (I am linked to another computer).
+    DeviceNo {
+        #[serde(default, deserialize_with = "lenient_string")]
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+        left: Option<u32>,
+    },
+    /// On every friend link between two linked computers, each sends a fresh
+    /// nonce, and answers the other's with `device_proof` =
+    /// BLAKE2s(label || S || prover key || verifier key || verifier nonce ||
+    /// prover nonce). Friend lists flow only once that proof checked out.
+    DeviceNonce { nonce: String },
+    DeviceProof { proof: String },
+    /// Forget our link (the sender unlinked, or holds no secret for us); also
+    /// "cancelled" while confirming a matched code.
+    DeviceUnlink,
+    /// After a matched code, the sender's user pressed 확인 ("본인의 PC가
+    /// 맞습니까?"). Only once both sent it does the link count.
+    DeviceConfirm,
+    /// 📱 Which of my two linked computers plays (only on a link where the
+    /// secret was proven both ways, only to `DEVICES_MIN_VERSION` peers; never
+    /// to friends). The one with the highest (`term`, install id) plays; the
+    /// other is on standby (no friend links). `you` = the receiver holds that
+    /// term, else the sender. A claim is the sender's term + 1. `idle` (seconds
+    /// since the sender's user last used it) is only in the first one on each
+    /// proven link: the computer used last then claims.
+    DeviceActive {
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+        term: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not", deserialize_with = "lenient_bool")]
+        you: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+        idle: Option<u64>,
+        /// This claim settles who plays as the two meet again (the one used
+        /// last): the receiver hands nothing over (see `device_state`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not", deserialize_with = "lenient_bool")]
+        meet: bool,
+    },
+    /// 📱 The selected pet and every pet's care, from the computer that plays
+    /// to my other computer (same rules as `device_active`). The one on
+    /// standby takes it from the computer that plays only. `handover` = the
+    /// sender just stopped playing because the receiver claimed: its last
+    /// state, taken unless the receiver changed its own meanwhile.
+    DeviceState {
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+        pet: Option<String>,
+        #[serde(default, deserialize_with = "lenient_list")]
+        care: Vec<WireCare>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not", deserialize_with = "lenient_bool")]
+        handover: bool,
     },
 }
 
@@ -384,6 +541,7 @@ mod tests {
                 gift: None,
                 style: None,
                 boost: None,
+                of: None,
             };
             #[allow(unused_variables)]
             if let Visit::Visit { $($field,)* .. } = &mut v {
@@ -676,7 +834,7 @@ mod tests {
 
     #[test]
     fn ping_can_carry_a_toss_that_old_peers_ignore() {
-        let t = Toss { kind: "can".into(), side: Side::Right, vside: Some(VSide::Down), fling: Some(Fling { height: 0.5, vx: 300.0, vy: -20.0 }), note: Some("붙였어!".into()), bounced: false, scale: None };
+        let t = Toss { kind: "can".into(), side: Side::Right, vside: Some(VSide::Down), fling: Some(Fling { height: 0.5, vx: 300.0, vy: -20.0 }), note: Some("붙였어!".into()), bounced: false, scale: None, look: None };
         let m = Message::Control(Control::Ping { ask: None, steer: None, toss: Some(t) });
         let j: serde_json::Value = serde_json::from_slice(&m.to_json()).unwrap();
         assert_eq!((j["type"].as_str(), j["toss"]["kind"].as_str(), j["toss"]["side"].as_str(), j["toss"]["vside"].as_str(), j["toss"]["note"].as_str()), (Some("ping"), Some("can"), Some("right"), Some("down"), Some("붙였어!")));
@@ -701,9 +859,14 @@ mod tests {
         let odd = br#"{"type":"ping","toss":{"kind":"can","side":"north","vside":3,"fling":{"height":"x"},"note":[1]}}"#;
         assert_eq!(
             Message::parse(odd),
-            Some(Message::Control(Control::Ping { ask: None, steer: None, toss: Some(Toss { kind: "can".into(), side: Side::Left, vside: None, fling: None, note: None, bounced: false, scale: None }) }))
+            Some(Message::Control(Control::Ping { ask: None, steer: None, toss: Some(Toss { kind: "can".into(), side: Side::Left, vside: None, fling: None, note: None, bounced: false, scale: None, look: None }) }))
         );
         // side가 없어도 왼쪽
+        // 똥 색 표시: 없으면 None, 있으면 그대로 (옛 버전은 모르는 필드를 무시한다). 글자가 아니면 버린다
+        let pink = Message::parse(br#"{"type":"ping","toss":{"kind":"poop","look":"pink"}}"#);
+        assert!(matches!(&pink, Some(Message::Control(Control::Ping { toss: Some(Toss { look: Some(l), .. }), .. })) if l == "pink"));
+        let odd = Message::parse(br#"{"type":"ping","toss":{"kind":"poop","look":7}}"#);
+        assert!(matches!(odd, Some(Message::Control(Control::Ping { toss: Some(Toss { look: None, .. }), .. }))));
         assert!(matches!(Message::parse(br#"{"type":"ping","toss":{"kind":"can"}}"#), Some(Message::Control(Control::Ping { toss: Some(Toss { side: Side::Left, .. }), .. }))));
     }
 
@@ -769,5 +932,79 @@ mod tests {
         assert_eq!(boost, Some(1.5));
         let Some(Message::Visit(Visit::Leave { boost, visit_id, .. })) = Message::parse(br#"{"type":"leave","visit_id":7,"boost":"huge"}"#) else { panic!() };
         assert_eq!((boost, visit_id), (None, 7));
+    }
+
+    #[test]
+    fn device_messages_skip_bad_entries_instead_of_failing() {
+        let k = "ab".repeat(32);
+        let raw = format!(r#"{{"type":"device_friends","friends":[{{"id":"x","key":"{k}","name":5,"side":7}},3,{{"id":"y"}},{{"id":"z","key":"{k}","name":"Z","side":"up"}}]}}"#);
+        let Some(Message::Control(Control::DeviceFriends { friends, want })) = Message::parse(raw.as_bytes()) else { panic!() };
+        assert!(!want);
+        assert_eq!(friends.len(), 2);
+        assert_eq!((friends[0].name.as_str(), friends[0].side.as_deref()), ("", None));
+        assert_eq!((friends[1].name.as_str(), friends[1].side.as_deref()), ("Z", Some("up")));
+        // 배열이 아니면 빈 목록, 없어도 빈 목록
+        let Some(Message::Control(Control::MyDevices { devices })) = Message::parse(br#"{"type":"my_devices","devices":"lots"}"#) else { panic!() };
+        assert!(devices.is_empty());
+        let Some(Message::Control(Control::DeviceFriends { friends, .. })) = Message::parse(br#"{"type":"device_friends"}"#) else { panic!() };
+        assert!(friends.is_empty());
+        // 보내는 모양
+        let m = Message::Control(Control::MyDevices { devices: vec![WireDevice { id: "d".into(), key: k.clone() }] });
+        assert_eq!(String::from_utf8(m.to_json()).unwrap(), format!(r#"{{"type":"my_devices","devices":[{{"id":"d","key":"{k}"}}]}}"#));
+        let m = Message::Control(Control::DeviceFriends { friends: vec![], want: false });
+        assert_eq!(String::from_utf8(m.to_json()).unwrap(), r#"{"type":"device_friends","friends":[]}"#);
+    }
+
+    #[test]
+    fn a_visit_may_say_it_is_my_other_computers_pet() {
+        let v = visit!(of: Some("b2".into()));
+        assert!(String::from_utf8(v.to_json()).unwrap().contains(r#""of":"b2""#));
+        assert!(!String::from_utf8(visit!().to_json()).unwrap().contains(r#""of""#), "absent unless carried");
+        let Some(Message::Visit(Visit::Visit { of, visit_id, .. })) = Message::parse(br#"{"type":"visit","visit_id":3,"species":"cat","stage":"child","scale":1,"personality":"p","owner":"A","enter_side":"left","of":7}"#) else { panic!() };
+        assert_eq!((of, visit_id), (None, 3), "a bad value is dropped, not the visit");
+    }
+
+    #[test]
+    fn device_link_messages_have_their_wire_shape_and_bad_fields_read_as_nothing() {
+        let shape = |m: Control| String::from_utf8(Message::Control(m).to_json()).unwrap();
+        assert_eq!(shape(Control::DeviceCode { nonce: "ab".into() }), r#"{"type":"device_code","nonce":"ab"}"#);
+        assert_eq!(shape(Control::DeviceCodeNonce { nonce: "ab".into() }), r#"{"type":"device_code_nonce","nonce":"ab"}"#);
+        assert_eq!(shape(Control::DeviceCodeProof { proof: "ab".into() }), r#"{"type":"device_code_proof","proof":"ab"}"#);
+        assert_eq!(shape(Control::DeviceCodeOk { proof: "ab".into() }), r#"{"type":"device_code_ok","proof":"ab"}"#);
+        assert_eq!(shape(Control::DeviceNo { reason: "wrong".into(), left: Some(3) }), r#"{"type":"device_no","reason":"wrong","left":3}"#);
+        assert_eq!(shape(Control::DeviceNo { reason: "none".into(), left: None }), r#"{"type":"device_no","reason":"none"}"#);
+        assert_eq!(shape(Control::DeviceNonce { nonce: "ab".into() }), r#"{"type":"device_nonce","nonce":"ab"}"#);
+        assert_eq!(shape(Control::DeviceProof { proof: "ab".into() }), r#"{"type":"device_proof","proof":"ab"}"#);
+        assert_eq!(shape(Control::DeviceUnlink), r#"{"type":"device_unlink"}"#);
+        assert_eq!(shape(Control::DeviceConfirm), r#"{"type":"device_confirm"}"#);
+        let Some(Message::Control(Control::DeviceNo { reason, left })) = Message::parse(br#"{"type":"device_no","reason":5,"left":"many"}"#) else { panic!() };
+        assert_eq!((reason.as_str(), left), ("", None));
+        assert_eq!(Message::parse(br#"{"type":"device_mark","on":true}"#), None, "gone before any release");
+        // 📱 누가 노는지
+        assert_eq!(shape(Control::DeviceActive { term: Some(2), you: false, idle: None, meet: false }), r#"{"type":"device_active","term":2}"#);
+        assert_eq!(shape(Control::DeviceActive { term: Some(0), you: true, idle: Some(5), meet: false }), r#"{"type":"device_active","term":0,"you":true,"idle":5}"#);
+        let Some(Message::Control(Control::DeviceActive { term, you, idle, .. })) = Message::parse(br#"{"type":"device_active","term":-3,"you":"yes","idle":"x"}"#) else { panic!() };
+        assert_eq!((term, you, idle), (None, false, None));
+    }
+
+    #[test]
+    fn device_state_and_the_meeting_claim_have_their_wire_shape() {
+        let shape = |m: Control| String::from_utf8(Message::Control(m).to_json()).unwrap();
+        let c = WireCare { pet: "cat".into(), stage: "child".into(), stamina: 3.0, fullness: 0.5, locked: true };
+        assert_eq!(
+            shape(Control::DeviceState { pet: Some("cat".into()), care: vec![c.clone()], handover: false }),
+            r#"{"type":"device_state","pet":"cat","care":[{"pet":"cat","stage":"child","stamina":3.0,"fullness":0.5,"locked":true}]}"#
+        );
+        assert!(shape(Control::DeviceState { pet: None, care: vec![], handover: true }).ends_with(r#""care":[],"handover":true}"#));
+        // 깨진 항목은 그 항목만 버린다
+        let Some(Message::Control(Control::DeviceState { pet, care, handover })) =
+            Message::parse(br#"{"type":"device_state","pet":7,"care":[{"pet":"cat","stage":"baby","stamina":1,"fullness":1},{"pet":"dog"},5],"handover":"yes"}"#)
+        else {
+            panic!()
+        };
+        assert_eq!((pet, handover), (None, false));
+        assert_eq!(care, vec![WireCare { pet: "cat".into(), stage: "baby".into(), stamina: 1.0, fullness: 1.0, locked: false }]);
+        // 다시 만나서 정한 주장 (넘겨주기 없음)
+        assert_eq!(shape(Control::DeviceActive { term: Some(2), you: false, idle: None, meet: true }), r#"{"type":"device_active","term":2,"meet":true}"#);
     }
 }

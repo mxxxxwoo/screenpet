@@ -17,14 +17,18 @@ PAGES = {
     "pair": "pair.html",
     "code": "code.html",
     "name": "name.html",
+    "link": "link.html",
     "size": "size.html",
+    "sleigh": "sleigh.html",
     "letter": "letter.html",
     "ladder": "ladder.html",
     "weather-1": "weather.html",
     "prop-gift-1": "gift.html",
     "book": "book.html",
+    "timeline": "timeline.html",
     "object-1": "object.html",
     "postit": "postit.html",
+    "dodge": "dodge.html",
 }
 # 음식 고르기는 펫·하우스 창에서만 그린다 (ladder·code 창도 common.js를 읽지만 부르지 않는다)
 ONLY_DEFINED_THERE = {"feed": {"pet", "guest-1", "house"}}

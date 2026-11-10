@@ -116,7 +116,7 @@ def round_names(folder):
 
 def test_every_round_gift_has_a_pixel_gift_and_shiny():
     names = round_names("gifts")
-    assert len(names) == 168
+    assert len(names) == 180  # v0.5.5: 곰·꿀벌·강아지 선물 −36, 펭귄 +12, 레서판다 +12, 다람쥐 +12
     assert round_names("gifts_pixel") == names
     for n in names:
         p = UI / "gifts_pixel" / f"{n}.png"
@@ -129,6 +129,36 @@ def test_gift_art_leaves_room_for_the_outline():
         for name, text in table.items():
             rows = icons.art(text)
             assert len(rows) <= side and max(map(len, rows)) <= side, name
+
+
+def test_hand_table_draws_exactly_the_round_hand_foods():
+    assert {f"hand_{n}" for n in icons.HAND} == {n for n in round_names("effects") if n.startswith("hand_")}
+
+
+def test_hand_lines_are_thin_dots_drawn_after_the_outline():
+    """가는 선(새우 더듬이)은 외곽선 뒤에 1칸으로 — 외곽선을 두르면 3칸 덩어리가 되어 뿔처럼 보인다."""
+    assert set(icons.HAND_LINES) <= set(icons.HAND)
+    for name, text in icons.HAND_LINES.items():
+        rows = icons.art(text)
+        assert len(rows) <= w.HAND_DOTS and max(map(len, rows)) <= w.HAND_DOTS, name
+        assert set("".join(rows)) <= set(w.PAL) | {"."}, name
+
+
+def test_pixel_shrimp_has_feelers_reaching_the_top_corner():
+    a = np.asarray(Image.open(UI / "effects_pixel" / "hand_shrimp.png").convert("RGBA"))
+    feeler = (a[..., :3] == w.PAL["R"]).all(axis=-1) & (a[..., 3] > 0)
+    ys, xs = np.nonzero(feeler)
+    assert len(ys) >= 4 and ys.min() == 0, "더듬이가 칸 맨 위까지"
+    assert (a[..., 3] > 0).sum() >= 90, "칸을 채운다"
+
+
+@pytest.mark.parametrize("name", ["squirrel_ginkgo", "squirrel_ginkgo_shiny"])
+def test_ginkgo_is_a_tilted_fan_on_a_stem_not_a_heart(name):
+    a = np.asarray(Image.open(UI / "gifts_pixel" / f"{name}.png").convert("RGBA"))
+    solid = a[..., 3] > 0
+    assert (solid != solid[:, ::-1]).sum() >= 20, "하트처럼 좌우 대칭이 아니다 (기울어진 부채)"
+    rows = icons.art(icons.GIFTS["squirrel_ginkgo"])
+    assert sum(r.count("d") for r in rows) >= 3, "잎자루"
 
 
 def test_shiny_differs_from_plain_and_has_white_sparkle_dots():
@@ -148,8 +178,8 @@ def test_every_round_effect_has_a_pixel_effect():
         assert (UI / "effects_pixel" / f"{n}.png").is_file(), n
 
 
-@pytest.mark.parametrize("name,size", [("bowl_food", w.PROP_DOTS), ("flower", w.PROP_DOTS), ("hand_special", (12, 12)),
-                                       ("snowman", w.SNOWMAN_DOTS), ("snowball", w.SNOWBALL_DOTS), ("snow_cloud", w.CLOUD_DOTS), ("sting", (32, 32))])
+@pytest.mark.parametrize("name,size", [("bowl_food", w.PROP_DOTS), ("cookie", w.PROP_DOTS), ("hand_special", (12, 12)),
+                                       ("snowman", w.SNOWMAN_DOTS), ("snowball", w.SNOWBALL_DOTS), ("snow_cloud", w.CLOUD_DOTS)])
 def test_effect_sizes_are_the_round_window_at_four_px_a_dot(name, size):
     assert Image.open(UI / "effects_pixel" / f"{name}.png").size == tuple(size)
 
@@ -174,7 +204,7 @@ def test_every_outlined_icon_leaves_room_for_its_outline(name, text, cw, ch, bot
     assert x >= 1 and x + aw <= cw - 1 and y >= 1 and y + len(rows) <= ch - 1, (x, y, aw, len(rows))
 
 
-@pytest.mark.parametrize("name,ink", [("snowman", w.INK), ("flower", w.INK), ("snow_cloud", (150, 170, 200))])
+@pytest.mark.parametrize("name,ink", [("snowman", w.INK), ("snow_cloud", (150, 170, 200))])
 def test_the_shipped_icon_has_a_closed_top_outline(name, ink):
     a = np.asarray(Image.open(UI / "effects_pixel" / f"{name}.png").convert("RGBA"))
     ys, xs = np.nonzero(a[..., 3])
@@ -185,7 +215,7 @@ def test_the_shipped_icon_has_a_closed_top_outline(name, ink):
 def test_objects_sit_where_the_tumble_shape_says():
     """코어 tumble.rs의 볼록 껍질(128칸)과 칸 그림의 네모가 몇 칸 안에서 맞는다 — 구를 때 바닥에 닿는 자리가 같다."""
     src = (ROOT / "crates" / "screenpet-core" / "src" / "tumble.rs").read_text(encoding="utf-8")
-    for kind in ("can", "paper", "stone", "glasses", "computer", "milk", "shirt", "umbrella", "poop", "dropping", "pellets"):
+    for kind in ("can", "paper", "stone", "glasses", "computer", "milk", "shirt", "umbrella", "poop", "pink", "rainbow", "pellets"):
         title = kind.capitalize()
         hull_txt = re.search(rf"ObjectKind::{title} => Shape .*?hull: &\[(.*?)\] \}}", src).group(1)
         pts = [(float(a), float(b)) for a, b in re.findall(r"\(([\d.]+), ([\d.]+)\)", hull_txt)]
@@ -241,7 +271,6 @@ def test_ui_wires_every_pixel_folder_and_keeps_round_paths():
     assert "gifts_pixel" in (UI / "book.js").read_text(encoding="utf-8")
     assert "objects_pixel" in (UI / "object.js").read_text(encoding="utf-8")
     assert "effects_pixel" in (UI / "prop.js").read_text(encoding="utf-8")
-    assert "effects_pixel" in (UI / "sting.js").read_text(encoding="utf-8")
     assert "effects_pixel" in (UI / "style.css").read_text(encoding="utf-8")
     assert "art-style" in (UI / "weather.js").read_text(encoding="utf-8")
     for f in ("prop.html", "gift.html", "object.html"):
@@ -261,7 +290,7 @@ def main_in_pixel_mode(pid, stage="teenager"):
     return node_json(tools / "nightcap_harness.js", pid, stage, "pixel")
 
 
-@pytest.mark.parametrize("pid", ["cat", "bear"])
+@pytest.mark.parametrize("pid", ["cat", "frog"])
 def test_main_window_wears_the_pixel_cap_on_whole_dots(pid):
     r = main_in_pixel_mode(pid)
     assert r["base"]["capHidden"] and not r["base"]["capPxHidden"], "SVG 대신 칸 모자"
@@ -411,7 +440,7 @@ def _worst_fit(table_name):
 
 
 def test_every_species_has_a_pixel_sheet_now():
-    assert len(_pixel_ids()) == 16
+    assert len(_pixel_ids()) == 18  # v0.5.5: 곰·꿀벌·강아지 −3, 펭귄 +1, 레서판다 +1, 다람쥐 +1
 
 
 def test_nightcap_table_fits_every_pixel_frame():
